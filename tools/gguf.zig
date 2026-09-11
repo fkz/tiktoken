@@ -8,33 +8,35 @@ const TokenCount = 50257;
 const Heads = 12;
 
 const BlockData = struct {
-    attnNormBias: *const Vector,
-    attnNormWeight: *const Vector,
-    attnQkvBias: *const [3]Vector,
-    attnQkvWeight: *const [3][LayerSize][LayerSize]u16,
-    attnOutputBias: *const Vector,
-    attnOutputWeight: *const Matrix,
-    ffnNormBias: *const Vector,
-    ffnNormWeight: *const Vector,
-    ffnUpBias: *const [Hidden]f32,
-    ffnUpWeight: *const [Hidden][LayerSize]u16,
-    ffnDownBias: *const Vector,
-    ffnDownWeight: *const [LayerSize][Hidden]u16,
+    attnNormBias: *align(64) const Vector,
+    attnNormWeight: *align(64) const Vector,
+    attnQkvBias: *align(64) const [3]Vector,
+    attnQkvWeight: *align(64) const [3][LayerSize][LayerSize]u16,
+    attnOutputBias: *align(64) const Vector,
+    attnOutputWeight: *align(64) const Matrix,
+    ffnNormBias: *align(64) const Vector,
+    ffnNormWeight: *align(64) const Vector,
+    ffnUpBias: *align(64) const [Hidden]f32,
+    ffnUpWeight: *align(64) const [Hidden][LayerSize]u16,
+    ffnDownBias: *align(64) const Vector,
+    ffnDownWeight: *align(64) const [LayerSize][Hidden]u16,
 };
+
+// 250MB
 
 gguf: []align(std.heap.page_size_min) u8,
 
 tensors: []align(32) u8,
 
 blocks: [BlockCount]BlockData,
-outputNormBias: *const Vector,
-outputNormWeight: *const Vector,
-positionEmbedWeight: *const [1024]Vector,
-tokenEmdebWeight: *const [TokenCount][LayerSize]u16,
+outputNormBias: *align(64) const Vector,
+outputNormWeight: *align(64) const Vector,
+positionEmbedWeight: *align(64) const [1024]Vector,
+tokenEmdebWeight: *align(64) const [TokenCount][LayerSize]u16,
 
 tokens: *const [TokenCount][]const u8,
 
-fn tensorAt(this: *@This(), T: type, offset: u64) *const T {
+fn tensorAt(this: *@This(), T: type, offset: u64) *align(64) const T {
     return @ptrCast(@alignCast(this.tensors[offset..][0..@sizeOf(T)]));
 }
 
@@ -79,7 +81,7 @@ fn readValue(reader: *std.Io.Reader, valueType: u32) !void {
         0 => reader.toss(1),
         1 => reader.toss(1),
         2 => reader.toss(2),
-        3 => reader.toss(3),
+        3 => reader.toss(2),
         4 => reader.toss(4),
         5 => reader.toss(4),
         6 => reader.toss(4),
@@ -148,7 +150,7 @@ fn init(io: std.Io, path: []const u8, alloc: std.mem.Allocator) !@This() {
         } else {
             try readValue(&reader, valueType);
         }
-        std.debug.print("Key {s}\n", .{key});
+        //std.debug.print("Key {s}\n", .{key});
     }
 
     var tensorOffsetList: [256]@Tuple(&[2]type{ []const u8, u64 }) = undefined;
@@ -156,26 +158,28 @@ fn init(io: std.Io, path: []const u8, alloc: std.mem.Allocator) !@This() {
     for (0..tensorCount) |jj| {
         const len = try reader.takeInt(u64, .little);
         const name = try reader.take(len);
-        var buf: [64]u8 = undefined;
-        var stderr = std.debug.lockStderr(&buf);
-        defer std.debug.unlockStderr();
-        try stderr.file_writer.interface.print("Tensor {s}: ", .{name});
+        //var buf: [64]u8 = undefined;
+        //var stderr = std.debug.lockStderr(&buf);
+        //defer std.debug.unlockStderr();
+        //try stderr.file_writer.interface.print("Tensor {s}: ", .{name});
         const dimensions = try reader.takeInt(u32, .little);
         var i: usize = 0;
-        (try stderr.file_writer.interface.writableSlice(1))[0] = '[';
+        //(try stderr.file_writer.interface.writableSlice(1))[0] = '[';
         while (i < dimensions) : ({
             i += 1;
         }) {
             const j = try reader.takeInt(u64, .little);
-            try stderr.file_writer.interface.print("{}", .{j});
-            (try stderr.file_writer.interface.writableSlice(1))[0] = 'x';
+            _ = j;
+            //try stderr.file_writer.interface.print("{}", .{j});
+            //(try stderr.file_writer.interface.writableSlice(1))[0] = 'x';
         }
-        stderr.file_writer.interface.buffer[stderr.file_writer.interface.end - 1] = ']';
+        //stderr.file_writer.interface.buffer[stderr.file_writer.interface.end - 1] = ']';
         const tpe = try reader.takeInt(u32, .little);
-        const tpeS = @tagName(@as(Ftype, @enumFromInt(tpe)));
+        _ = tpe;
+        //const tpeS = @tagName(@as(Ftype, @enumFromInt(tpe)));
         const offset = try reader.takeInt(u64, .little);
 
-        std.debug.print(": {s} at offset {X}\n", .{ tpeS, offset });
+        //try stderr.file_writer.interface.print(": {s} at offset {X}\n", .{ tpeS, offset });
         tensorOffsetList[jj] = .{ name, offset };
     }
 
@@ -220,12 +224,12 @@ fn layerNorm(from: *const Vector, bias: *const Vector, weight: *const Vector, to
     accumulators = .{.{0.0} ** 16} ** Para;
     while (i < LayerSize) : (i += Para * 16) {
         inline for (0..Para) |j| {
-            accumulators[j] += (from[i..][0..16].* - vect) * (from[i..][0..16].* - vect);
+            accumulators[j] += (from[i + 16 * j ..][0..16].* - vect) * (from[i + 16 * j ..][0..16].* - vect);
         }
     }
 
     const sum2 = accumulators[0] + accumulators[1] + accumulators[2] + accumulators[3];
-    const c = 1.0 / @sqrt(@reduce(.Add, sum2) + 1e-10);
+    const c = 1.0 / @sqrt(@reduce(.Add, sum2) / LayerSize + 1e-10);
     const cc: @Vector(16, f32) = @splat(c);
 
     i = 0;
@@ -255,23 +259,25 @@ fn convBf16ToF32(from: *const [LayerSize]u16, to: *Vector) void {
     }
 }
 
-fn BiasWeightCalc(S: comptime_int, S1: comptime_int, S2: comptime_int) type {
+fn BiasWeightCalc(S: comptime_int, S1: comptime_int, S2: comptime_int, comptime hasBias: bool) type {
     return struct {
-        bias: *const [S][S2]f32,
+        const P = 8;
+        //const P = 1;
+        bias: if (hasBias) *const [S][S2]f32 else void,
         weight: *const [S][S2][S1]u16,
 
-        optimizedWeight: *const [S][S2 / 16 / 8][S1 / 2][8]@Vector(32, u16),
+        optimizedWeight: *const [S][S2 / 16 / P][S1 / 2][P]@Vector(32, u16),
 
-        fn init(alloc: std.mem.Allocator, bias: *const [S][S2]f32, weight: *const [S][S2][S1]u16) !@This() {
+        fn init(alloc: std.mem.Allocator, bias: if (hasBias) *const [S][S2]f32 else void, weight: *const [S][S2][S1]u16) !@This() {
             const optimizedWeight = try alloc.create(@typeInfo(@FieldType(@This(), "optimizedWeight")).pointer.child);
             for (0..S) |v| {
-                for (0..S2 / 16 / 8) |l| {
+                for (0..S2 / 16 / P) |l| {
                     for (0..S1 / 2) |m| {
-                        for (0..8) |n| {
+                        for (0..P) |n| {
                             var r: [32]u16 = undefined;
                             for (0..16) |u| {
-                                r[2 * u] = weight[v][16 * 8 * l + 16 * n + u][2 * m];
-                                r[2 * u + 1] = weight[v][16 * 8 * l + 16 * n + u][2 * m + 1];
+                                r[2 * u] = weight[v][16 * P * l + 16 * n + u][2 * m];
+                                r[2 * u + 1] = weight[v][16 * P * l + 16 * n + u][2 * m + 1];
                             }
                             optimizedWeight[v][l][m][n] = r;
                         }
@@ -286,17 +292,12 @@ fn BiasWeightCalc(S: comptime_int, S1: comptime_int, S2: comptime_int) type {
         }
 
         fn calculate(this: *const @This(), in: *const [S1]f32, outputs: [S]*[S2]f32) void {
-            for (outputs, 0..) |o, j| {
-                for (0..S2) |i| {
-                    o[i] = this.bias[j][i];
-                }
-            }
             for (outputs, 0..) |o, v| {
-                for (0..S2 / 16 / 8) |l| {
-                    var accums: [8]@Vector(16, f32) = undefined;
-                    inline for (0..8) |n| {
+                for (0..S2 / 16 / P) |l| {
+                    var accums: [P]@Vector(16, f32) = undefined;
+                    inline for (0..P) |n| {
                         inline for (0..16) |u| {
-                            accums[n][u] = this.bias[v][16 * 8 * l + 16 * n + u];
+                            accums[n][u] = if (hasBias) this.bias[v][16 * P * l + 16 * n + u] else 0.0;
                         }
                     }
                     for (0..S1 / 16) |m0| {
@@ -310,7 +311,7 @@ fn BiasWeightCalc(S: comptime_int, S1: comptime_int, S2: comptime_int) type {
                         var ins: [8]@Vector(32, u16) = undefined;
                         inline for (0..8) |m| {
                             comptime var mask: @Vector(32, usize) = undefined;
-                            inline for (0..8) |k| {
+                            inline for (0..16) |k| {
                                 mask[2 * k] = 2 * m;
                                 mask[2 * k + 1] = 2 * m + 1;
                             }
@@ -319,8 +320,8 @@ fn BiasWeightCalc(S: comptime_int, S1: comptime_int, S2: comptime_int) type {
 
                         for (0..8) |m| {
                             const in1 = ins[m];
-                            inline for (0..8) |n| {
-                                const weights: @Vector(32, u16) = this.optimizedWeight[v][l][m][n];
+                            inline for (0..P) |n| {
+                                const weights: @Vector(32, u16) = this.optimizedWeight[v][l][8 * m0 + m][n];
                                 accums[n] = asm ("vdpbf16ps %[in1], %[in2], %[acc]"
                                     : [acc] "=v" (-> @Vector(16, f32)),
                                     : [acc_in] "0" (accums[n]),
@@ -330,8 +331,8 @@ fn BiasWeightCalc(S: comptime_int, S1: comptime_int, S2: comptime_int) type {
                             }
                         }
                     }
-                    for (0..8) |n| {
-                        o[16 * 8 * l + 16 * n ..][0..16].* = accums[n];
+                    for (0..P) |n| {
+                        o[16 * P * l + 16 * n ..][0..16].* = accums[n];
                     }
                 }
             }
@@ -340,7 +341,7 @@ fn BiasWeightCalc(S: comptime_int, S1: comptime_int, S2: comptime_int) type {
 }
 
 const KvCache = struct {
-    weights: BiasWeightCalc(3, LayerSize, LayerSize),
+    weights: BiasWeightCalc(3, LayerSize, LayerSize, true),
 
     ks: []Vector,
     vs: []Vector,
@@ -348,7 +349,7 @@ const KvCache = struct {
 
     fn init(alloc: std.mem.Allocator, attnQkvBias: *const [3]Vector, attnQkvWeight: *const [3][LayerSize][LayerSize]u16) !KvCache {
         return .{
-            .weights = try BiasWeightCalc(3, LayerSize, LayerSize).init(alloc, attnQkvBias, attnQkvWeight),
+            .weights = try BiasWeightCalc(3, LayerSize, LayerSize, true).init(alloc, attnQkvBias, attnQkvWeight),
             .ks = try alloc.alloc(Vector, 1024),
             .vs = try alloc.alloc(Vector, 1024),
             .length = 0,
@@ -362,6 +363,7 @@ const KvCache = struct {
     }
 
     fn attend(this: *const @This(), q: *const Vector, out: *Vector) void {
+        @setFloatMode(.optimized);
         for (0..Heads) |h| {
             var s: [1024]f32 = undefined;
             var smax = -std.math.inf(f32);
@@ -379,9 +381,12 @@ const KvCache = struct {
                 sum += s[i];
             }
             const sumR = 1.0 / sum;
+            for (0..64) |w| {
+                out[h * 64 + w] = 0.0;
+            }
             for (0..this.length) |i| {
                 for (0..64) |w| {
-                    out[h * 64 + w] = s[i] * sumR * this.vs[i][h * 64 + w];
+                    out[h * 64 + w] += s[i] * sumR * this.vs[i][h * 64 + w];
                 }
             }
         }
@@ -396,10 +401,10 @@ const LayerCalculation = struct {
 
     kvCache: KvCache,
 
-    output: BiasWeightCalc(1, LayerSize, LayerSize),
+    output: BiasWeightCalc(1, LayerSize, LayerSize, true),
 
-    ffnUp: BiasWeightCalc(1, LayerSize, Hidden),
-    ffnDown: BiasWeightCalc(1, Hidden, LayerSize),
+    ffnUp: BiasWeightCalc(1, LayerSize, Hidden, true),
+    ffnDown: BiasWeightCalc(1, Hidden, LayerSize, true),
 
     fn attend(this: *@This(), in: *const Vector, out: *Vector) void {
         var v: Vector = undefined;
@@ -420,7 +425,7 @@ const LayerCalculation = struct {
     const u = @sqrt(2.0 / std.math.pi);
 
     fn gelu(v: *[Hidden]f32) void {
-        for (0..Hidden) |i| {
+        for (0..Hidden / 8) |i| {
             const c = v[i];
             const r = c / 2.0 * (1.0 + std.math.tanh(u * (c + 0.044715 * c * c * c)));
             v[i] = r;
@@ -440,18 +445,29 @@ const LayerCalculation = struct {
     }
 };
 
-fn logitsF(v: *const Vector, tokenWeights: *const [TokenCount][LayerSize]u16, logits: *[TokenCount]f32, tokens: *const [TokenCount][]const u8) void {
-    for (0..TokenCount) |i| {
-        logits[i] = 0.0;
-    }
+const LogitsF = struct {
+    calc: BiasWeightCalc(1, LayerSize, 50304, false),
 
-    for (0..LayerSize) |l| {
-        for (0..TokenCount) |i| {
-            logits[i] += v[l] * tokenWeights[i][l];
+    fn init(alloc: std.mem.Allocator, tokenWeights: *const [TokenCount][LayerSize]u16) !LogitsF {
+        const tmp = try alloc.create([50304][LayerSize]u16);
+        @memmove(tmp[0..TokenCount], tokenWeights);
+        for (TokenCount..50304) |i| {
+            for (0..LayerSize) |j| {
+                tmp[i][j] = 0.0;
+            }
         }
+        return .{ .calc = try BiasWeightCalc(1, LayerSize, 50304, false).init(alloc, {}, tmp) };
     }
 
-    var maxim: [8]f32 = .{0.0} ** 8;
+    fn logits(this: *const @This(), v: *const Vector, l: *[50304]f32) void {
+        this.calc.calculate(v, .{l});
+    }
+};
+
+fn logitsF(logF: *const LogitsF, v: *const Vector, logits: *[50304]f32, tokens: *const [TokenCount][]const u8) u16 {
+    logF.logits(v, logits);
+
+    var maxim: [8]f32 = .{-std.math.inf(f32)} ** 8;
     var maximIndex: [8]u16 = .{0} ** 8;
 
     for (0..TokenCount) |i| {
@@ -473,15 +489,17 @@ fn logitsF(v: *const Vector, tokenWeights: *const [TokenCount][LayerSize]u16, lo
 
     var sum: f32 = 0.0;
     const max = maxim[0];
-    std.debug.print("max {}\n", .{max});
     for (0..TokenCount) |i| {
         logits[i] = @exp(logits[i] - max);
         sum += logits[i];
     }
 
-    for (0..8) |i| {
-        std.debug.print("token {} '{s}' prob {d:.6} {}\n", .{ maximIndex[i], tokens[maximIndex[i]], logits[maximIndex[i]] / sum, maxim[i] });
-    }
+    //for (0..8) |i| {
+    //std.debug.print("token {} '{s}' prob {d:.1}%\n", .{ maximIndex[i], tokens[maximIndex[i]], logits[maximIndex[i]] / sum * 100.0 });
+    //}
+
+    std.debug.print("{f}", .{DecodedToken{ .token = tokens[maximIndex[0]] }});
+    return maximIndex[0];
 }
 
 pub fn main(ini: std.process.Init) !void {
@@ -498,9 +516,9 @@ pub fn main(ini: std.process.Init) !void {
             .ffnBias = vv.blocks[i].ffnNormBias,
             .ffnWeight = vv.blocks[i].ffnNormWeight,
             .kvCache = try KvCache.init(ini.arena.allocator(), vv.blocks[i].attnQkvBias, vv.blocks[i].attnQkvWeight),
-            .output = try BiasWeightCalc(1, LayerSize, LayerSize).init(ini.arena.allocator(), vv.blocks[i].attnOutputBias, vv.blocks[i].attnOutputWeight),
-            .ffnUp = try BiasWeightCalc(1, LayerSize, Hidden).init(ini.arena.allocator(), vv.blocks[i].ffnUpBias, vv.blocks[i].ffnUpWeight),
-            .ffnDown = try BiasWeightCalc(1, Hidden, LayerSize).init(ini.arena.allocator(), vv.blocks[i].ffnDownBias, vv.blocks[i].ffnDownWeight),
+            .output = try BiasWeightCalc(1, LayerSize, LayerSize, true).init(ini.arena.allocator(), vv.blocks[i].attnOutputBias, vv.blocks[i].attnOutputWeight),
+            .ffnUp = try BiasWeightCalc(1, LayerSize, Hidden, true).init(ini.arena.allocator(), vv.blocks[i].ffnUpBias, vv.blocks[i].ffnUpWeight),
+            .ffnDown = try BiasWeightCalc(1, Hidden, LayerSize, true).init(ini.arena.allocator(), vv.blocks[i].ffnDownBias, vv.blocks[i].ffnDownWeight),
         };
     }
 
@@ -524,13 +542,69 @@ pub fn main(ini: std.process.Init) !void {
     }
     std.debug.print("\n", .{});
 
+    const lg = try LogitsF.init(ini.arena.allocator(), vv.tokenEmdebWeight);
+
     if (pos > 0) {
-        var to: Vector = undefined;
-        var logits: [TokenCount]f32 = undefined;
-        layerNorm(&vec, vv.outputNormBias, vv.outputNormWeight, &to);
-        logitsF(&to, vv.tokenEmdebWeight, &logits, vv.tokens);
+        while (pos < 200) {
+            var to: Vector = undefined;
+            var logits: [50304]f32 = undefined;
+            layerNorm(&vec, vv.outputNormBias, vv.outputNormWeight, &to);
+            const next = logitsF(&lg, &to, &logits, vv.tokens);
+            convBf16ToF32(&vv.tokenEmdebWeight[next], &vec);
+            for (0..LayerSize) |u| {
+                vec[u] += vv.positionEmbedWeight[pos][u];
+            }
+            pos += 1;
+
+            for (0..12) |layer| {
+                var v: Vector = undefined;
+                layers[layer].attend(&vec, &v);
+                layers[layer].ffn(&v, &vec);
+            }
+        }
     }
 }
+
+fn gpt2CodepointToByte(cp: u21) ?u8 {
+    // Bytes kept unchanged by GPT-2's byte encoder.
+    if (cp >= '!' and cp <= '~') return @intCast(cp);
+    if (cp >= 0x00A1 and cp <= 0x00AC) return @intCast(cp);
+    if (cp >= 0x00AE and cp <= 0x00FF) return @intCast(cp);
+
+    // Bytes represented by synthetic Unicode code points.
+    if (cp >= 0x0100 and cp <= 0x0120)
+        return @intCast(cp - 0x0100); // bytes 0–32
+
+    if (cp >= 0x0121 and cp <= 0x0142)
+        return @intCast(cp - 0x0121 + 127); // bytes 127–160
+
+    if (cp == 0x0143) return 173;
+
+    return null;
+}
+
+const DecodedToken = struct {
+    token: []const u8,
+
+    pub fn format(self: @This(), writer: *std.Io.Writer) !void {
+        var view = std.unicode.Utf8View.init(self.token) catch {
+            return error.WriteFailed;
+        };
+        var iterator = view.iterator();
+
+        while (iterator.nextCodepoint()) |cp| {
+            if (gpt2CodepointToByte(cp)) |byte| {
+                try writer.writeByte(byte);
+            } else {
+                var buf: [4]u8 = undefined;
+                const len = std.unicode.utf8Encode(cp, &buf) catch {
+                    return error.WriteFailed;
+                };
+                try writer.writeAll(buf[0..len]);
+            }
+        }
+    }
+};
 
 test "order in simd" {
     const a: [16]u16 = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };

@@ -309,6 +309,24 @@ pub fn main(init: std.process.Init) !void {
             try f.interface.print("{any}\n", .{w.tokens});
             try f.flush();
             return;
+        } else if (std.mem.eql(u8, arg, "tokenize-only")) {
+            var buf: [4096]u8 = undefined;
+            var r = std.Io.File.stdin().reader(init.io, &buf);
+            const d = try r.interface.allocRemaining(init.arena.allocator(), .unlimited);
+            var h = buildHashStructure(t);
+            var w = try TokenizeHeap.init(d, &h, init.arena.allocator());
+            while (w.next()) {}
+            var f = std.Io.File.stdout().writer(init.io, &buf);
+            for (w.tokens) |u| {
+                if (u < 61000) {
+                    const tt =
+                        if (u <= 32) u + 188 else if (u <= 126) u - 33 else if (u <= 160) u + 94 else if (u <= 172) u - 67 else if (u <= 255) u - 68 else u;
+
+                    try f.interface.print("{} ", .{tt});
+                }
+            }
+            try f.flush();
+            return;
         }
 
         count = try std.fmt.parseInt(usize, arg, 10);
