@@ -281,6 +281,11 @@ test "parsing" {
 pub fn main(init: std.process.Init) !void {
     var it = init.minimal.args.iterate();
     _ = it.skip();
+    return run(init, it);
+}
+
+pub fn run(init: std.process.Init, args: anytype) !void {
+    var it = args;
     const command = it.next();
     if (command) |arg| {
         if (std.mem.eql(u8, arg, "extract-merges")) {

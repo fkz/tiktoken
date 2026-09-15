@@ -587,7 +587,7 @@ const SyncThreads = struct {
 
     fn start(this: *@This()) !void {
         for (0..ThreadCount - 1) |i| {
-            this.threads[i] = try std.Thread.spawn(.{}, run, .{ this, i });
+            this.threads[i] = try std.Thread.spawn(.{}, SyncThreads.run, .{ this, i });
         }
     }
 
@@ -637,6 +637,11 @@ const SyncThreads = struct {
 pub fn main(ini: std.process.Init) !void {
     var iter = ini.minimal.args.iterate();
     _ = iter.skip();
+    return run(ini, iter);
+}
+
+pub fn run(ini: std.process.Init, args: anytype) !void {
+    var iter = args;
     const filename = iter.next() orelse "";
     const vv = try init(ini.io, filename, ini.arena.allocator());
 
