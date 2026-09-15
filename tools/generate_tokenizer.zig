@@ -55,7 +55,8 @@ fn tokensFromIterator(it: anytype) ?[Size]TokenValue {
     var progress: u16 = 0;
     while (it.next()) |line| {
         if (line.len == 0) continue;
-        const newProgress = @as(usize, index) * 100 / Size;
+        if (index - 256 >= Size) return null;
+        const newProgress = @as(usize, index - 256) * 100 / Size;
         if (progress < newProgress) {
             progress = @intCast(newProgress);
             std.debug.print("Progress: {}%\n", .{progress});
@@ -73,10 +74,6 @@ fn tokensFromIterator(it: anytype) ?[Size]TokenValue {
             .resultToken = index,
         };
         index += 1;
-        if (index == Size) {
-            std.debug.print("Warning: Size reached, not all token grammar", .{});
-            break;
-        }
     }
     return result;
 }
@@ -105,33 +102,11 @@ const lookupTable: [512]u8 = blk: {
 };
 
 fn loop1(toks: *const [Size]TokenValue, hv: u32, counts: *[CacheSize]u8, breakCond: u8) bool {
-    var index: u32 = 0;
-    while (index < Size) {
-        //std.debug.print("DD {} {}\n", .{ t.resultToken, index });
-        const h0 = hash(toks[index].token1, toks[index].token2, hv);
-        const h1 = hash(toks[index + 1].token1, toks[index + 1].token2, hv);
-
-        counts[h0] +|= 1;
-        if (counts[h0] == breakCond) {
-            return false;
-        }
-        counts[h1] +|= 1;
-        if (counts[h1] == breakCond) {
-            return false;
-        }
-
-        // const byte_index0 = h0 >> 1;
-        // const byte_index1 = h1 >> 1;
-        // const old0 = counts[byte_index0];
-        // const old1 = counts[byte_index1];
-        // if (byte_index0 != byte_index1) {
-        //     counts[byte_index0] = lookupTable[old0 * 2 + (h0 & 1)];
-        //     counts[byte_index1] = lookupTable[old1 * 2 + (h1 & 1)];
-        // } else {
-        //     counts[byte_index0] =
-        //         lookupTable[lookupTable[old0 * 2 + (h0 & 1)] + (h1 & 1)];
-        // }
-        index += 2;
+    for (toks) |t| {
+        if (t.resultToken == 0) continue;
+        const h = hash(t.token1, t.token2, hv);
+        counts[h] +|= 1;
+        if (counts[h] == breakCond) return false;
     }
     return true;
 }
@@ -278,6 +253,32 @@ test "parsing" {
     try std.testing.expect(tokens("unknown t\n") == null);
 }
 
+test "parsing all merge slots and rejecting overflow" {
+    const RepeatedMerges = struct {
+        remaining: usize,
+        fn next(self: *@This()) ?[]const u8 {
+            if (self.remaining == 0) return null;
+            self.remaining -= 1;
+            return "a b";
+        }
+    };
+    var full = RepeatedMerges{ .remaining = Size };
+    const parsed = tokensFromIterator(&full).?;
+    try std.testing.expectEqual(@as(u16, Size + 255), parsed[Size - 1].resultToken);
+    try std.testing.expectEqual(@as(usize, 0), full.remaining);
+    var overflow = RepeatedMerges{ .remaining = Size + 1 };
+    try std.testing.expect(tokensFromIterator(&overflow) == null);
+}
+
+test "parsing partial grammar hash ignores padding" {
+    const parsed = tokens("a b\nb c\n").?;
+    const h = buildHashStructure(&parsed);
+    try std.testing.expectEqual(@as(?u16, 256), h.lookup('a', 'b'));
+    try std.testing.expectEqual(@as(?u16, 257), h.lookup('b', 'c'));
+    try std.testing.expectEqual(@as(?u16, null), h.lookup(0, 0));
+    try std.testing.expectEqual(@as(?u16, null), h.lookup('x', 'y'));
+}
+
 pub fn main(init: std.process.Init) !void {
     var it = init.minimal.args.iterate();
     _ = it.skip();
@@ -340,7 +341,7 @@ pub fn run(init: std.process.Init, args: anytype) !void {
             for (w.tokens) |u| {
                 if (u < 61000) {
                     const tt =
-                        if (u <= 32) u + 188 else if (u <= 126) u - 33 else if (u <= 160) u + 94 else if (u <= 172) u - 67 else if (u <= 255) u - 68 else u;
+                        if (u <= 32) u + 188 else if (u <= 126) u - 33 else if (u <= 160) u + 94 else if (u <= 172) u - 67 else if (u == 173) 255 else if (u <= 255) u - 68 else u;
 
                     try f.interface.print("{} ", .{tt});
                 }
@@ -406,15 +407,14 @@ fn buildHashStructure(toks: *const [Size]TokenValue) HashData {
     var bucketActuallyFilled: [Buckets]u8 = .{0} ** Buckets;
     var completelyFilledUpTo: u16 = 0;
     var result: HashData = .{
-        .buckets = undefined,
+        .buckets = .{Bucket{ .from = @splat(0xFFFFFFFF), .to = .{0} ** 8 }} ** Buckets,
         .indices = .{0xFFFF} ** CacheSize,
         .oversizeStartIndex = 6222,
         .hashAlgo = fixedMul,
     };
 
-    var j: usize = 0;
     for (toks) |t| {
-        j += 1;
+        if (t.resultToken == 0) continue;
         const h = hash(t.token1, t.token2, fixedMul);
         var index = result.indices[h];
         if (index == 0xFFFF) {
@@ -783,8 +783,8 @@ const TokenizeHeap = struct {
         const heap = try alloc.alloc(HeapData, 2 * str.len);
         var heapSize: usize = 0;
         var i: usize = 0;
-        t[str.len - 1] = str[str.len - 1];
-        while (i <= str.len - 2) {
+        if (str.len > 0) t[str.len - 1] = str[str.len - 1];
+        while (i + 1 < str.len) {
             t[i] = str[i];
             const curr = str[i];
             const n = str[i + 1];
@@ -831,4 +831,34 @@ test "Sample tokenization" {
         std.debug.print("{f}\n", .{th});
     }
     try std.testing.expectFmt("|Test| string|", "{f}", .{th});
+}
+
+// Uses the same merge engine and ID mapping as tokenize-only, without a tokens file.
+// Allocations belong to the caller's arena.
+pub fn encodeGguf(alloc: std.mem.Allocator, data: []const u8, text: []const u8) ![]u16 {
+    var iterator = try @import("gguf_merges.zig").Iterator.init(data);
+    const grammar = try alloc.create([Size]TokenValue);
+    grammar.* = tokensFromIterator(&iterator) orelse return error.InvalidMerges;
+    var h = buildHashStructure(grammar);
+    var heap = try TokenizeHeap.init(text, &h, alloc);
+    while (heap.next()) {}
+    var result: std.ArrayList(u16) = .empty;
+    for (heap.tokens) |u| {
+        if (u == 0xFFFF) continue;
+        const id = if (u <= 32) u + 188 else if (u <= 126) u - 33 else if (u <= 160) u + 94 else if (u <= 172) u - 67 else if (u == 173) 255 else if (u <= 255) u - 68 else u;
+        try result.append(alloc, id);
+    }
+    return result.toOwnedSlice(alloc);
+}
+
+test "parsing empty and single-byte prompts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const h: HashData = undefined; // Neither input has a pair to look up.
+    var empty = try TokenizeHeap.init("", &h, arena.allocator());
+    try std.testing.expect(!empty.next());
+    try std.testing.expectEqual(@as(usize, 0), empty.tokens.len);
+    var single = try TokenizeHeap.init("a", &h, arena.allocator());
+    try std.testing.expect(!single.next());
+    try std.testing.expectEqualSlices(u16, &.{'a'}, single.tokens);
 }

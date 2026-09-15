@@ -10,6 +10,7 @@ const usage =
     \\  tiktoken generate_tokenizer tokenize-only
     \\  tiktoken generate_tokenizer [hash-search-count]
     \\  tiktoken gguf <model.gguf> <token-id>...
+    \\  tiktoken continue <model.gguf> [text] (reads stdin if omitted)
     \\
 ;
 
@@ -22,6 +23,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, command, "generate_tokenizer")) return tokenizer.run(init, args);
     if (std.mem.eql(u8, command, "gguf")) return gguf.run(init, args);
+    if (std.mem.eql(u8, command, "continue")) return gguf.runText(init, args, tokenizer);
     try printUsage(init.io);
     return error.UnknownCommand;
 }

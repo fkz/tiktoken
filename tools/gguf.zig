@@ -644,7 +644,32 @@ pub fn run(ini: std.process.Init, args: anytype) !void {
     var iter = args;
     const filename = iter.next() orelse "";
     const vv = try init(ini.io, filename, ini.arena.allocator());
+    var ids: std.ArrayList(u16) = .empty;
+    while (iter.next()) |arg| {
+        try ids.append(ini.arena.allocator(), try std.fmt.parseInt(u16, arg, 10));
+    }
+    return generate(ini, &vv, ids.items, false);
+}
 
+pub fn runText(ini: std.process.Init, args: anytype, comptime tokenizer: type) !void {
+    var iter = args;
+    const filename = iter.next() orelse return error.MissingGgufPath;
+    const prompt = if (iter.next()) |text| text else blk: {
+        var buffer: [4096]u8 = undefined;
+        var reader = std.Io.File.stdin().reader(ini.io, &buffer);
+        break :blk try reader.interface.allocRemaining(ini.arena.allocator(), .unlimited);
+    };
+    if (iter.next() != null) return error.TooManyArguments;
+    if (prompt.len == 0) return error.EmptyPrompt;
+    const vv = try init(ini.io, filename, ini.arena.allocator());
+    const ids = try tokenizer.encodeGguf(ini.arena.allocator(), vv.gguf, prompt);
+    return generate(ini, &vv, ids, true);
+}
+
+fn generate(ini: std.process.Init, vv: *const @This(), ids: []const u16, text_output: bool) !void {
+    if (ids.len > 1024) return error.PromptTooLong;
+    if (text_output and ids.len == 1024) return error.PromptTooLong;
+    for (ids) |id| if (id >= TokenCount) return error.InvalidTokenId;
     var layers: [12]LayerCalculation = undefined;
     for (0..12) |i| {
         layers[i] = .{
@@ -661,13 +686,17 @@ pub fn run(ini: std.process.Init, args: anytype) !void {
 
     var threadSync = SyncThreads.init();
     try threadSync.start();
+    defer threadSync.stop();
 
     var pos: usize = 0;
     var vec: Vector = undefined;
-    while (iter.next()) |a| {
-        const j = try std.fmt.parseInt(u16, a, 10);
+    for (ids) |j| {
         const token = &vv.tokenEmdebWeight[j];
-        std.debug.print("{s}", .{vv.tokens[j]});
+        if (text_output) {
+            std.debug.print("{f}", .{DecodedToken{ .token = vv.tokens[j] }});
+        } else {
+            std.debug.print("{s}", .{vv.tokens[j]});
+        }
         convBf16ToF32(token, &vec);
         for (0..LayerSize) |u| {
             vec[u] += vv.positionEmbedWeight[pos][u];
@@ -680,12 +709,13 @@ pub fn run(ini: std.process.Init, args: anytype) !void {
             layers[layer].ffn(&threadSync, &v, &vec);
         }
     }
-    std.debug.print("\n", .{});
+    if (!text_output) std.debug.print("\n", .{});
 
     const lg = try LogitsF.init(ini.arena.allocator(), vv.tokenEmdebWeight);
 
     if (pos > 0) {
-        while (pos < 200) {
+        const limit = if (text_output) @min(ids.len + 200, 1024) else 200;
+        while (pos < limit) {
             var to: Vector = undefined;
             var logits: [50304]f32 = undefined;
             layerNorm(&vec, vv.outputNormBias, vv.outputNormWeight, &to);
@@ -703,7 +733,7 @@ pub fn run(ini: std.process.Init, args: anytype) !void {
             }
         }
     }
-    threadSync.stop();
+    if (text_output) std.debug.print("\n", .{});
 }
 
 fn gpt2CodepointToByte(cp: u21) ?u8 {
