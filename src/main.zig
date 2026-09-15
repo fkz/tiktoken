@@ -8,9 +8,9 @@ const usage =
     \\  tiktoken generate_tokenizer extract-merges <model.gguf> [merges.txt]
     \\  tiktoken generate_tokenizer tokenize
     \\  tiktoken generate_tokenizer tokenize-only
-    \\  tiktoken generate_tokenizer [hash-search-count]
+    \\  tiktoken generate_tokenizer [hash-search-count] [merges.txt]
     \\  tiktoken gguf <model.gguf> <token-id>...
-    \\  tiktoken continue <model.gguf> [text] (reads stdin if omitted)
+    \\  tiktoken continue <model.gguf> [text] (reads stdin if omitted; creates ./tokens if missing)
     \\
 ;
 

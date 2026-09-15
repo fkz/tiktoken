@@ -661,8 +661,8 @@ pub fn runText(ini: std.process.Init, args: anytype, comptime tokenizer: type) !
     };
     if (iter.next() != null) return error.TooManyArguments;
     if (prompt.len == 0) return error.EmptyPrompt;
+    const ids = try tokenizer.encodeTableOrGenerate(ini.io, ini.arena.allocator(), filename, "tokens", prompt);
     const vv = try init(ini.io, filename, ini.arena.allocator());
-    const ids = try tokenizer.encodeGguf(ini.arena.allocator(), vv.gguf, prompt);
     return generate(ini, &vv, ids, true);
 }
 

@@ -1,2 +1,6 @@
 /.zig-cache/
 /zig-out/
+
+# Generated tokenizer cache and local profiling recordings
+/tokens
+/perf.data*

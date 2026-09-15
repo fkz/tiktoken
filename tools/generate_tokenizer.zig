@@ -11,7 +11,7 @@ const Size = 50000;
 const Bits = 14;
 const CacheSize = std.math.pow(usize, 2, Bits);
 
-fn findTokenId(strs: [Size][2][]const u8, str: []const u8, count: u16) ?u16 {
+fn findTokenId(strs: *const [Size][2][]const u8, str: []const u8, count: u16) ?u16 {
     if (str.len == 1) return str[0];
     if (str.len == 2 and str[0] & 0xFE == 0xC2) {
         return 128 + (str[0] & 1) * 64 + (str[1] & 63);
@@ -56,17 +56,12 @@ fn tokensFromIterator(it: anytype) ?[Size]TokenValue {
     while (it.next()) |line| {
         if (line.len == 0) continue;
         if (index - 256 >= Size) return null;
-        const newProgress = @as(usize, index - 256) * 100 / Size;
-        if (progress < newProgress) {
-            progress = @intCast(newProgress);
-            std.debug.print("Progress: {}%\n", .{progress});
-        }
         var l = std.mem.splitScalar(u8, line, ' ');
         const t1 = l.next() orelse return null;
         const t2 = l.next() orelse return null;
         if (t1.len == 0 or t2.len == 0 or l.next() != null) return null;
-        const t1tok = findTokenId(strs, t1, index) orelse return null;
-        const t2tok = findTokenId(strs, t2, index) orelse return null;
+        const t1tok = findTokenId(&strs, t1, index) orelse return null;
+        const t2tok = findTokenId(&strs, t2, index) orelse return null;
         strs[index - 256] = .{ t1, t2 };
         result[index - 256] = TokenValue{
             .token1 = t1tok,
@@ -74,6 +69,11 @@ fn tokensFromIterator(it: anytype) ?[Size]TokenValue {
             .resultToken = index,
         };
         index += 1;
+        const newProgress = @as(usize, index - 256) * 4 / Size * 25;
+        if (progress < newProgress) {
+            progress = @intCast(newProgress);
+            std.debug.print("Progress: {}%\n", .{progress});
+        }
     }
     return result;
 }
@@ -239,7 +239,7 @@ fn generateTokens(io: std.Io, input: []const u8, output: []const u8) !void {
         break :blk tokensFromIterator(&it) orelse return error.InvalidMerges;
     } else tokens(data) orelse return error.InvalidMerges;
     try std.Io.Dir.cwd().writeFile(io, .{
-        .data = std.mem.asBytes(&parsed),
+        .data = &serializeHash(&buildHashStructure(&parsed)),
         .sub_path = output,
     });
 }
@@ -304,25 +304,29 @@ pub fn run(init: std.process.Init, args: anytype) !void {
             return;
         }
     }
+    const is_tokenize = if (command) |arg| std.mem.eql(u8, arg, "tokenize") or std.mem.eql(u8, arg, "tokenize-only") else false;
+    if (!is_tokenize) {
+        const input = it.next() orelse "src/merges.txt";
+        if (it.next() != null) return error.TooManyArguments;
+        const source = try std.Io.Dir.cwd().readFileAlloc(init.io, input, init.arena.allocator(), .unlimited);
+        const parsed = tokens(source) orelse return error.InvalidMerges;
+        var grammar = parsed;
+        try tryHashTok(init.io, &grammar, if (command) |arg| try std.fmt.parseInt(usize, arg, 10) else 10_000, 10);
+        return;
+    }
     const file = try std.Io.Dir.cwd().openFile(init.io, "tokens", .{});
-    const mapped = try std.posix.mmap(
-        null,
-        @sizeOf([Size]TokenValue),
-        .{ .READ = true },
-        .{ .TYPE = .PRIVATE },
-        file.handle,
-        0,
-    );
-    const t: *[Size]TokenValue = @ptrCast(mapped);
-    var count: usize = 10_000;
-    const breakCond: u8 = 10;
+    defer file.close(init.io);
+    const stat = try file.stat(init.io);
+    if (stat.size != TableBytes) return error.InvalidTokenTable;
+    const mapped = try std.posix.mmap(null, TableBytes, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
+    defer std.posix.munmap(mapped);
+    const h = try loadHash(mapped);
     if (command) |arg| {
         if (std.mem.eql(u8, arg, "tokenize")) {
             // parse stdin
             var buf: [4096]u8 = undefined;
             var r = std.Io.File.stdin().reader(init.io, &buf);
             const d = try r.interface.allocRemaining(init.arena.allocator(), .unlimited);
-            var h = buildHashStructure(t);
             var w = try TokenizeHeap.init(d, &h, init.arena.allocator());
             while (w.next()) {}
             var f = std.Io.File.stdout().writer(init.io, &buf);
@@ -334,7 +338,6 @@ pub fn run(init: std.process.Init, args: anytype) !void {
             var buf: [4096]u8 = undefined;
             var r = std.Io.File.stdin().reader(init.io, &buf);
             const d = try r.interface.allocRemaining(init.arena.allocator(), .unlimited);
-            var h = buildHashStructure(t);
             var w = try TokenizeHeap.init(d, &h, init.arena.allocator());
             while (w.next()) {}
             var f = std.Io.File.stdout().writer(init.io, &buf);
@@ -349,15 +352,13 @@ pub fn run(init: std.process.Init, args: anytype) !void {
             try f.flush();
             return;
         }
-
-        count = try std.fmt.parseInt(usize, arg, 10);
     }
-    try tryHashTok(init.io, t, count, breakCond);
 }
 
-const Bucket = struct {
-    from: @Vector(8, u32),
+const Bucket = extern struct {
+    from: [8]u32 align(64),
     to: [8]u16,
+    padding: [16]u8 = .{0} ** 16,
 
     fn add(this: *Bucket, index: u8, t: TokenValue) void {
         const p: *[8]u32 = @ptrCast(&this.from);
@@ -374,14 +375,33 @@ const HashData = struct {
     indices: [CacheSize]u16,
     oversizeStartIndex: u16,
 
+    fn view(this: *const HashData) HashView {
+        return .{ .hashAlgo = this.hashAlgo, .buckets = &this.buckets, .indices = &this.indices, .oversizeStartIndex = this.oversizeStartIndex };
+    }
+
     fn lookup(this: *const HashData, tok1: u16, tok2: u16) ?u16 {
+        return this.view().lookup(tok1, tok2);
+    }
+};
+
+const HashView = struct {
+    hashAlgo: u32,
+    buckets: *const [Buckets]Bucket,
+    indices: *const [CacheSize]u16,
+    oversizeStartIndex: u16,
+
+    fn view(this: *const HashView) HashView {
+        return this.*;
+    }
+
+    fn lookup(this: *const HashView, tok1: u16, tok2: u16) ?u16 {
         const h = this.indices[hash(tok1, tok2, this.hashAlgo)];
-        const bools = this.buckets[h].from == @as(@Vector(8, u32), @splat(@as(u32, tok1) | (@as(u32, tok2) << 16)));
+        const bools = @as(@Vector(8, u32), this.buckets[h].from) == @as(@Vector(8, u32), @splat(@as(u32, tok1) | (@as(u32, tok2) << 16)));
         const index = @ctz(@as(u8, @bitCast(bools)));
 
         if (index == 8 and h >= this.oversizeStartIndex) {
             @branchHint(.unlikely);
-            const bools2 = this.buckets[h + 1].from == @as(@Vector(8, u32), @splat(@as(u32, tok1) | (@as(u32, tok2) << 16)));
+            const bools2 = @as(@Vector(8, u32), this.buckets[h + 1].from) == @as(@Vector(8, u32), @splat(@as(u32, tok1) | (@as(u32, tok2) << 16)));
             const index2 = @ctz(@as(u8, @bitCast(bools2)));
             if (index2 == 8) return null;
             return this.buckets[h + 1].to[index2];
@@ -391,6 +411,87 @@ const HashData = struct {
         }
     }
 };
+
+// Version 1: 64-byte header, little-endian indices, then 64-byte buckets.
+const IndexOffset = 64;
+const BucketOffset = IndexOffset + CacheSize * 2;
+const TableBytes = BucketOffset + Buckets * 64;
+const TableMagic = "TIKHASH\x00";
+
+fn serializeHash(h: *const HashData) [TableBytes]u8 {
+    var bytes: [TableBytes]u8 = @splat(0);
+    @memcpy(bytes[0..8], TableMagic);
+    const fields = [_]u32{ 1, h.hashAlgo, IndexOffset, CacheSize, BucketOffset, Buckets, h.oversizeStartIndex, TableBytes };
+    for (fields, 0..) |v, i| std.mem.writeInt(u32, bytes[8 + i * 4 ..][0..4], v, .little);
+    for (h.indices, 0..) |v, i| std.mem.writeInt(u16, bytes[IndexOffset + i * 2 ..][0..2], v, .little);
+    for (h.buckets, 0..) |bucket, i| {
+        const offset = BucketOffset + i * 64;
+        for (bucket.from, 0..) |v, j| std.mem.writeInt(u32, bytes[offset + j * 4 ..][0..4], v, .little);
+        for (bucket.to, 0..) |v, j| std.mem.writeInt(u16, bytes[offset + 32 + j * 2 ..][0..2], v, .little);
+    }
+    return bytes;
+}
+
+fn loadHash(bytes: []align(64) const u8) !HashView {
+    if (@import("builtin").target.cpu.arch.endian() != .little) return error.UnsupportedTokenTableEndian;
+    if (bytes.len != TableBytes or !std.mem.eql(u8, bytes[0..8], TableMagic)) return error.InvalidTokenTable;
+    var fields: [8]u32 = undefined;
+    for (&fields, 0..) |*v, i| v.* = std.mem.readInt(u32, bytes[8 + i * 4 ..][0..4], .little);
+    if (fields[0] != 1) return error.UnsupportedTokenTableVersion;
+    if (fields[2] != IndexOffset or fields[3] != CacheSize or fields[4] != BucketOffset or fields[5] != Buckets or fields[6] >= Buckets or fields[7] != TableBytes) return error.InvalidTokenTable;
+    const indices: *const [CacheSize]u16 = @ptrCast(@alignCast(bytes.ptr + IndexOffset));
+    for (indices) |index| {
+        if (index >= Buckets or (index >= fields[6] and index + 1 >= Buckets)) return error.InvalidTokenTable;
+    }
+    comptime {
+        std.debug.assert(@sizeOf(Bucket) == 64);
+        std.debug.assert(@offsetOf(Bucket, "to") == 32);
+    }
+    return .{ .hashAlgo = fields[1], .indices = indices, .buckets = @ptrCast(@alignCast(bytes.ptr + BucketOffset)), .oversizeStartIndex = @intCast(fields[6]) };
+}
+
+test "parsing persisted hash round trip and validation" {
+    const grammar = tokens("a b\nb c\nab c\n").?;
+    const original = buildHashStructure(&grammar);
+    var bytes align(64) = serializeHash(&original);
+    const loaded = try loadHash(&bytes);
+    for (grammar) |token| {
+        if (token.resultToken == 0) continue;
+        try std.testing.expectEqual(@as(?u16, token.resultToken), loaded.lookup(token.token1, token.token2));
+    }
+    try std.testing.expectEqual(@as(?u16, null), loaded.lookup('x', 'y'));
+    var before = try TokenizeHeap.init("abc ab bc xyz", &original, std.testing.allocator);
+    defer before.deinit(std.testing.allocator);
+    var after = try TokenizeHeap.init("abc ab bc xyz", &loaded, std.testing.allocator);
+    defer after.deinit(std.testing.allocator);
+    while (before.next()) {}
+    while (after.next()) {}
+    try std.testing.expectEqualSlices(u16, before.tokens, after.tokens);
+    const ids = try encodeHash(std.testing.allocator, &loaded, "abc ab bc xyz");
+    defer std.testing.allocator.free(ids);
+    try std.testing.expectEqualSlices(u16, &.{ 258, 220, 256, 220, 257, 220, 87, 88, 89 }, ids);
+    try std.testing.expectError(error.InvalidTokenTable, loadHash(bytes[0..64]));
+    bytes[0] = 0;
+    try std.testing.expectError(error.InvalidTokenTable, loadHash(&bytes));
+    bytes[0] = 'T';
+    bytes[8] = 2;
+    try std.testing.expectError(error.UnsupportedTokenTableVersion, loadHash(&bytes));
+    bytes[8] = 1;
+    std.mem.writeInt(u16, bytes[IndexOffset..][0..2], Buckets - 1, .little);
+    try std.testing.expectError(error.InvalidTokenTable, loadHash(&bytes));
+}
+
+test "parsing persisted overflow bucket" {
+    const grammar = tokens("a b\n").?;
+    var original = buildHashStructure(&grammar);
+    original.indices[hash('a', 'b', original.hashAlgo)] = original.oversizeStartIndex;
+    original.buckets[original.oversizeStartIndex + 1].add(7, grammar[0]);
+    var bytes align(64) = serializeHash(&original);
+    const loaded = try loadHash(&bytes);
+    try std.testing.expectEqual(@as(?u16, 256), loaded.lookup('a', 'b'));
+    bytes[16] = 0;
+    try std.testing.expectError(error.InvalidTokenTable, loadHash(&bytes));
+}
 
 fn buildHashStructure(toks: *const [Size]TokenValue) HashData {
     //const fixedMul = 0xACDD9B61;
@@ -407,7 +508,7 @@ fn buildHashStructure(toks: *const [Size]TokenValue) HashData {
     var bucketActuallyFilled: [Buckets]u8 = .{0} ** Buckets;
     var completelyFilledUpTo: u16 = 0;
     var result: HashData = .{
-        .buckets = .{Bucket{ .from = @splat(0xFFFFFFFF), .to = .{0} ** 8 }} ** Buckets,
+        .buckets = .{Bucket{ .from = .{0xFFFFFFFF} ** 8, .to = .{0} ** 8 }} ** Buckets,
         .indices = .{0xFFFF} ** CacheSize,
         .oversizeStartIndex = 6222,
         .hashAlgo = fixedMul,
@@ -466,41 +567,25 @@ fn buildHashStructure(toks: *const [Size]TokenValue) HashData {
     return result;
 }
 
-test "build hash" {
+test "persisted full table lookups" {
     const file = try std.Io.Dir.cwd().openFile(std.testing.io, "tokens", .{});
-    const mapped = try std.posix.mmap(
-        null,
-        @sizeOf([Size]TokenValue),
-        .{ .READ = true },
-        .{ .TYPE = .PRIVATE },
-        file.handle,
-        0,
-    );
-    const t: *[Size]TokenValue = @ptrCast(mapped);
-    _ = buildHashStructure(t);
-    try std.testing.expect(false);
-}
-
-test "hashing" {
-    const file = try std.Io.Dir.cwd().openFile(std.testing.io, "tokens", .{});
-    const mapped = try std.posix.mmap(
-        null,
-        @sizeOf([Size]TokenValue),
-        .{ .READ = true },
-        .{ .TYPE = .PRIVATE },
-        file.handle,
-        0,
-    );
-    const t: *[Size]TokenValue = @ptrCast(mapped);
-    var firstWrong: u16 = 0;
-    while (firstWrong < Size - 1) {
-        firstWrong += 1;
-        if (firstWrong != 43434 and (t[firstWrong].resultToken == 0 or t[firstWrong].resultToken == 43690)) {
-            break;
+    defer file.close(std.testing.io);
+    const stat = try file.stat(std.testing.io);
+    if (stat.size != TableBytes) return error.InvalidTokenTable;
+    const mapped = try std.posix.mmap(null, TableBytes, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
+    defer std.posix.munmap(mapped);
+    const h = try loadHash(mapped);
+    const expected = try encodeHash(std.testing.allocator, &h, "abc ab bc xyz");
+    defer std.testing.allocator.free(expected);
+    const actual = try encodeTable(std.testing.io, std.testing.allocator, "tokens", "abc ab bc xyz");
+    defer std.testing.allocator.free(actual);
+    try std.testing.expectEqualSlices(u16, expected, actual);
+    for (h.buckets) |bucket| {
+        for (bucket.from, bucket.to) |pair, result| {
+            if (pair == 0xFFFFFFFF) continue;
+            try std.testing.expectEqual(@as(?u16, result), h.lookup(@truncate(pair), @truncate(pair >> 16)));
         }
     }
-    std.debug.print("{} {}\n", .{ firstWrong, t[firstWrong] });
-    try std.testing.expectEqual(60000, firstWrong);
 }
 
 test "u4 bitcast ordering" {
@@ -708,7 +793,7 @@ const TokenHeap = struct {
 const TokenizeHeap = struct {
     original: []const u8,
     heap: TokenHeap,
-    hd: *const HashData,
+    hd: HashView,
     tokens: []u16,
 
     fn next(this: *@This()) bool {
@@ -778,7 +863,7 @@ const TokenizeHeap = struct {
         try writer.writeByte('|');
     }
 
-    fn init(str: []const u8, hashData: *const HashData, alloc: std.mem.Allocator) !TokenizeHeap {
+    fn init(str: []const u8, hashData: anytype, alloc: std.mem.Allocator) !TokenizeHeap {
         const t = try alloc.alloc(u16, str.len);
         const heap = try alloc.alloc(HeapData, 2 * str.len);
         var heapSize: usize = 0;
@@ -803,28 +888,25 @@ const TokenizeHeap = struct {
             .original = str,
             .tokens = t,
             .heap = TokenHeap.init(heap, try alloc.alloc(u16, 2 * str.len), heapSize),
-            .hd = hashData,
+            .hd = hashData.view(),
         };
     }
 
     fn deinit(this: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(this.heap.data);
+        alloc.free(this.heap.tags);
         alloc.free(this.tokens);
     }
 };
 
 test "Sample tokenization" {
     const file = try std.Io.Dir.cwd().openFile(std.testing.io, "tokens", .{});
-    const mapped = try std.posix.mmap(
-        null,
-        @sizeOf([Size]TokenValue),
-        .{ .READ = true },
-        .{ .TYPE = .PRIVATE },
-        file.handle,
-        0,
-    );
-    const t: *[Size]TokenValue = @ptrCast(mapped);
-    const h = buildHashStructure(t);
+    defer file.close(std.testing.io);
+    const stat = try file.stat(std.testing.io);
+    if (stat.size != TableBytes) return error.InvalidTokenTable;
+    const mapped = try std.posix.mmap(null, TableBytes, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
+    defer std.posix.munmap(mapped);
+    const h = try loadHash(mapped);
     var th = try TokenizeHeap.init("Test string", &h, std.testing.allocator);
     defer th.deinit(std.testing.allocator);
     while (th.next()) {
@@ -833,16 +915,65 @@ test "Sample tokenization" {
     try std.testing.expectFmt("|Test| string|", "{f}", .{th});
 }
 
+pub fn encodeTableOrGenerate(io: std.Io, alloc: std.mem.Allocator, model: []const u8, path: []const u8, text: []const u8) ![]u16 {
+    return encodeTable(io, alloc, path, text) catch |err| switch (err) {
+        error.FileNotFound => blk: {
+            try generateTokens(io, model, path);
+            break :blk try encodeTable(io, alloc, path, text);
+        },
+        else => return err,
+    };
+}
+
+test "parsing missing table generation and existing table reuse" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const source = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/merges.txt", .{tmp.sub_path});
+    defer alloc.free(source);
+    const table = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/tokens", .{tmp.sub_path});
+    defer alloc.free(table);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "merges.txt", .data = "a b\nb c\nab c\n" });
+    const generated = try encodeTableOrGenerate(std.testing.io, alloc, source, table, "abc");
+    defer alloc.free(generated);
+    try std.testing.expectEqualSlices(u16, &.{258}, generated);
+    // Reuse must succeed even when the original source is no longer available.
+    try tmp.dir.deleteFile(std.testing.io, "merges.txt");
+    const reused = try encodeTableOrGenerate(std.testing.io, alloc, source, table, "abc");
+    defer alloc.free(reused);
+    try std.testing.expectEqualSlices(u16, generated, reused);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tokens", .data = "invalid" });
+    try std.testing.expectError(error.InvalidTokenTable, encodeTableOrGenerate(std.testing.io, alloc, source, table, "abc"));
+}
+
+// The mapping only needs to live until encoding finishes; returned IDs are owned by alloc.
+pub fn encodeTable(io: std.Io, alloc: std.mem.Allocator, path: []const u8, text: []const u8) ![]u16 {
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.size != TableBytes) return error.InvalidTokenTable;
+    const mapped = try std.posix.mmap(null, TableBytes, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
+    defer std.posix.munmap(mapped);
+    const h = try loadHash(mapped);
+    return encodeHash(alloc, &h, text);
+}
+
 // Uses the same merge engine and ID mapping as tokenize-only, without a tokens file.
 // Allocations belong to the caller's arena.
 pub fn encodeGguf(alloc: std.mem.Allocator, data: []const u8, text: []const u8) ![]u16 {
     var iterator = try @import("gguf_merges.zig").Iterator.init(data);
     const grammar = try alloc.create([Size]TokenValue);
     grammar.* = tokensFromIterator(&iterator) orelse return error.InvalidMerges;
-    var h = buildHashStructure(grammar);
-    var heap = try TokenizeHeap.init(text, &h, alloc);
+    const h = buildHashStructure(grammar);
+    return encodeHash(alloc, &h.view(), text);
+}
+
+fn encodeHash(alloc: std.mem.Allocator, h: *const HashView, text: []const u8) ![]u16 {
+    var heap = try TokenizeHeap.init(text, h, alloc);
+    defer heap.deinit(alloc);
     while (heap.next()) {}
     var result: std.ArrayList(u16) = .empty;
+    errdefer result.deinit(alloc);
     for (heap.tokens) |u| {
         if (u == 0xFFFF) continue;
         const id = if (u <= 32) u + 188 else if (u <= 126) u - 33 else if (u <= 160) u + 94 else if (u <= 172) u - 67 else if (u == 173) 255 else if (u <= 255) u - 68 else u;
