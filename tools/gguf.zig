@@ -7,6 +7,8 @@ const Matrix = [LayerSize][LayerSize]u16;
 const TokenCount = 50257;
 const Heads = 12;
 
+const ThreadCount = 2;
+
 const BlockData = struct {
     attnNormBias: *align(64) const Vector,
     attnNormWeight: *align(64) const Vector,
@@ -291,14 +293,25 @@ fn BiasWeightCalc(S: comptime_int, S1: comptime_int, S2: comptime_int, comptime 
             };
         }
 
-        fn calculate(this: *const @This(), in: *const [S1]f32, outputs: [S]*[S2]f32) void {
+        fn calculateErased(this: *const anyopaque, in: *const anyopaque, outputs: [3]*anyopaque, threadId: usize) void {
+            const this_: *const @This() = @ptrCast(@alignCast(this));
+            const in_: *const [S1]f32 = @ptrCast(@alignCast(in));
+            var outputs_: [S]*[S2]f32 = undefined;
+            inline for (0..S) |s| {
+                outputs_[s] = @ptrCast(@alignCast(outputs[s]));
+            }
+            this_.calculate(in_, outputs_, threadId);
+        }
+
+        fn calculate(this: *const @This(), in: *const [S1]f32, outputs: [S]*[S2]f32, threadId: usize) void {
             for (outputs, 0..) |o, v| {
-                for (0..S2 / 16 / P) |l| {
+                const whole = S2 / 16 / P;
+                const begin = whole * threadId / ThreadCount;
+                const end = whole * (threadId + 1) / ThreadCount;
+                for (begin..end) |l| {
                     var accums: [P]@Vector(16, f32) = undefined;
                     inline for (0..P) |n| {
-                        inline for (0..16) |u| {
-                            accums[n][u] = if (hasBias) this.bias[v][16 * P * l + 16 * n + u] else 0.0;
-                        }
+                        accums[n] = if (hasBias) this.bias[v][16 * P * l + 16 * n ..][0..16].* else @as([16]f32, .{0.0} ** 16);
                     }
                     for (0..S1 / 16) |m0| {
                         const in0: @Vector(16, f32) = in[16 * m0 ..][0..16].*;
@@ -318,10 +331,18 @@ fn BiasWeightCalc(S: comptime_int, S1: comptime_int, S2: comptime_int, comptime 
                             ins[m] = @shuffle(u16, inC, inC, mask);
                         }
 
+                        const w1 = this.optimizedWeight[v][l][8 * m0 ..][0..8];
+                        //const w1prefetch = this.optimizedWeight[v][l][8 * (m0 + 1) ..][0..8];
                         for (0..8) |m| {
                             const in1 = ins[m];
+                            const w2 = w1[m];
+                            //const w2prefetch = &w1[m + 12];
+                            //@prefetch(&w2prefetch[0], .{ .locality = 0 });
                             inline for (0..P) |n| {
-                                const weights: @Vector(32, u16) = this.optimizedWeight[v][l][8 * m0 + m][n];
+                                const weights: @Vector(32, u16) = w2[n];
+                                //@prefetch(&w2prefetch[n], .{
+                                //    .locality = 0,
+                                //});
                                 accums[n] = asm ("vdpbf16ps %[in1], %[in2], %[acc]"
                                     : [acc] "=v" (-> @Vector(16, f32)),
                                     : [acc_in] "0" (accums[n]),
@@ -341,52 +362,85 @@ fn BiasWeightCalc(S: comptime_int, S1: comptime_int, S2: comptime_int, comptime 
 }
 
 const KvCache = struct {
+    const MaxLen = 1024;
+
     weights: BiasWeightCalc(3, LayerSize, LayerSize, true),
 
-    ks: []Vector,
-    vs: []Vector,
+    ks: *[MaxLen / 16][LayerSize][16]f32,
+    vs: *[MaxLen]Vector,
     length: usize,
 
     fn init(alloc: std.mem.Allocator, attnQkvBias: *const [3]Vector, attnQkvWeight: *const [3][LayerSize][LayerSize]u16) !KvCache {
+        const ks = try alloc.create([MaxLen / 16][LayerSize][16]f32);
+        for (ks) |*k| {
+            for (k) |*kk| {
+                for (0..16) |i| {
+                    kk[i] = 0.0;
+                }
+            }
+        }
+        const vs = try alloc.create([MaxLen]Vector);
+        for (vs) |*v| {
+            for (v) |*vv| {
+                vv.* = -std.math.inf(f32);
+            }
+        }
+
         return .{
             .weights = try BiasWeightCalc(3, LayerSize, LayerSize, true).init(alloc, attnQkvBias, attnQkvWeight),
-            .ks = try alloc.alloc(Vector, 1024),
-            .vs = try alloc.alloc(Vector, 1024),
+            .ks = ks,
+            .vs = vs,
             .length = 0,
         };
     }
 
-    fn next(this: *@This(), in: *const Vector, q: *Vector) void {
-        const outputs: [3]*Vector = .{ q, &this.ks[this.length], &this.vs[this.length] };
+    fn next(this: *@This(), syncThreads: *SyncThreads, in: *const Vector, q: *Vector) void {
+        var k: Vector = undefined;
+        const outputs: [3]*Vector = .{ q, &k, &this.vs[this.length] };
+        syncThreads.calculate(3, LayerSize, LayerSize, true, &this.weights, in, outputs);
+        for (0..LayerSize) |i| {
+            this.ks[this.length / 16][i][this.length % 16] = k[i];
+        }
         this.length += 1;
-        this.weights.calculate(in, outputs);
     }
 
     fn attend(this: *const @This(), q: *const Vector, out: *Vector) void {
         @setFloatMode(.optimized);
         for (0..Heads) |h| {
             var s: [1024]f32 = undefined;
-            var smax = -std.math.inf(f32);
-            for (0..this.length) |i| {
-                s[i] = 0.0;
+            var smax: @Vector(16, f32) = @splat(-std.math.inf(f32));
+            const lenUp = (this.length + 15) / 16;
+            for (0..lenUp) |i| {
+                var acc: @Vector(16, f32) = @splat(0.0);
                 for (0..64) |w| {
-                    s[i] += q[h * 64 + w] * this.ks[i][h * 64 + w];
+                    const qq: @Vector(16, f32) = @splat(q[h * 64 + w]);
+                    acc += qq * this.ks[i][h * 64 + w];
                 }
-                s[i] *= 0.125;
-                if (smax < s[i]) smax = s[i];
+                acc *= @splat(0.125);
+                inline for (0..16) |lane| {
+                    if (i + 1 == lenUp and this.length % 16 != 0 and this.length % 16 <= lane) {
+                        acc[lane] = -std.math.inf(f32);
+                    }
+                }
+                s[16 * i ..][0..16].* = acc;
+                smax = @max(smax, acc);
             }
+            const max = @reduce(.Max, smax);
             var sum: f32 = 0.0;
-            for (0..this.length) |i| {
-                s[i] = @exp(s[i] - smax);
+            for (0..16 * lenUp) |i| {
+                s[i] = @exp(s[i] - max);
                 sum += s[i];
             }
             const sumR = 1.0 / sum;
+            const sumRV: @Vector(16, f32) = @splat(sumR);
             for (0..64) |w| {
                 out[h * 64 + w] = 0.0;
             }
             for (0..this.length) |i| {
-                for (0..64) |w| {
-                    out[h * 64 + w] += s[i] * sumR * this.vs[i][h * 64 + w];
+                for (0..64 / 16) |w| {
+                    const sI: @Vector(16, f32) = @splat(s[i]);
+                    const vec: @Vector(16, f32) = out[h * 64 + w * 16 ..][0..16].*;
+                    out[h * 64 + w * 16 ..][0..16].* = vec + sI * sumRV * this.vs[i][h * 64 + w * 16 ..][0..16].*;
                 }
             }
         }
@@ -406,16 +460,17 @@ const LayerCalculation = struct {
     ffnUp: BiasWeightCalc(1, LayerSize, Hidden, true),
     ffnDown: BiasWeightCalc(1, Hidden, LayerSize, true),
 
-    fn attend(this: *@This(), in: *const Vector, out: *Vector) void {
+    fn attend(this: *@This(), syncThreads: *SyncThreads, in: *const Vector, out: *Vector) void {
         var v: Vector = undefined;
         layerNorm(in, this.normBias, this.normWeight, &v);
 
         var q: Vector = undefined;
         var a: Vector = undefined;
 
-        this.kvCache.next(&v, &q);
+        this.kvCache.next(syncThreads, &v, &q);
         this.kvCache.attend(&q, &a);
-        this.output.calculate(&a, .{out});
+
+        syncThreads.calculate(1, LayerSize, LayerSize, true, &this.output, &a, .{out});
 
         for (0..LayerSize) |i| {
             out[i] += in[i];
@@ -425,20 +480,20 @@ const LayerCalculation = struct {
     const u = @sqrt(2.0 / std.math.pi);
 
     fn gelu(v: *[Hidden]f32) void {
-        for (0..Hidden / 8) |i| {
+        for (0..Hidden) |i| {
             const c = v[i];
             const r = c / 2.0 * (1.0 + std.math.tanh(u * (c + 0.044715 * c * c * c)));
             v[i] = r;
         }
     }
 
-    fn ffn(this: *@This(), in: *const Vector, out: *Vector) void {
+    fn ffn(this: *@This(), syncThreads: *SyncThreads, in: *const Vector, out: *Vector) void {
         var v: Vector = undefined;
         var hidden: [Hidden]f32 = undefined;
         layerNorm(in, this.ffnBias, this.ffnWeight, &v);
-        this.ffnUp.calculate(&v, .{&hidden});
+        syncThreads.calculate(1, LayerSize, Hidden, true, &this.ffnUp, &v, .{&hidden});
         gelu(&hidden);
-        this.ffnDown.calculate(&hidden, .{out});
+        syncThreads.calculate(1, Hidden, LayerSize, true, &this.ffnDown, &hidden, .{out});
         for (0..LayerSize) |i| {
             out[i] += in[i];
         }
@@ -459,13 +514,13 @@ const LogitsF = struct {
         return .{ .calc = try BiasWeightCalc(1, LayerSize, 50304, false).init(alloc, {}, tmp) };
     }
 
-    fn logits(this: *const @This(), v: *const Vector, l: *[50304]f32) void {
-        this.calc.calculate(v, .{l});
+    fn logits(this: *const @This(), syncThreads: *SyncThreads, v: *const Vector, l: *[50304]f32) void {
+        syncThreads.calculate(1, LayerSize, 50304, false, &this.calc, v, .{l});
     }
 };
 
-fn logitsF(logF: *const LogitsF, v: *const Vector, logits: *[50304]f32, tokens: *const [TokenCount][]const u8) u16 {
-    logF.logits(v, logits);
+fn logitsF(logF: *const LogitsF, syncThreads: *SyncThreads, v: *const Vector, logits: *[50304]f32, tokens: *const [TokenCount][]const u8) u16 {
+    logF.logits(syncThreads, v, logits);
 
     var maxim: [8]f32 = .{-std.math.inf(f32)} ** 8;
     var maximIndex: [8]u16 = .{0} ** 8;
@@ -502,6 +557,83 @@ fn logitsF(logF: *const LogitsF, v: *const Vector, logits: *[50304]f32, tokens: 
     return maximIndex[0];
 }
 
+const SyncThreads = struct {
+    currentTask: usize,
+    calculateFn: *const fn (
+        *const anyopaque,
+        *const anyopaque,
+        [3]*anyopaque,
+        usize,
+    ) void,
+    calculateData: *const anyopaque,
+    calculateIn: *const anyopaque,
+    calculateOut: [3]*anyopaque,
+    stp: bool,
+    threads: [ThreadCount - 1]?std.Thread,
+    finished: [ThreadCount - 1]u512 align(64), // align on cache line
+
+    fn init() SyncThreads {
+        return .{
+            .currentTask = 0,
+            .calculateData = undefined,
+            .calculateIn = undefined,
+            .calculateOut = undefined,
+            .calculateFn = undefined,
+            .finished = .{0} ** (ThreadCount - 1),
+            .stp = false,
+            .threads = .{null} ** (ThreadCount - 1),
+        };
+    }
+
+    fn start(this: *@This()) !void {
+        for (0..ThreadCount - 1) |i| {
+            this.threads[i] = try std.Thread.spawn(.{}, run, .{ this, i });
+        }
+    }
+
+    fn run(this: *@This(), threadId: usize) void {
+        var nextTask: usize = 1;
+        while (true) {
+            while (@atomicLoad(usize, &this.currentTask, .acquire) != nextTask) {
+                std.atomic.spinLoopHint();
+            }
+            if (this.stp) return;
+            this.calculateFn(this.calculateData, this.calculateIn, this.calculateOut, threadId);
+            @atomicStore(usize, @as(*usize, @ptrCast(&this.finished[threadId])), nextTask, .release);
+            nextTask += 1;
+        }
+    }
+
+    fn calculate(this: *@This(), S: comptime_int, S1: comptime_int, S2: comptime_int, comptime hasBias: bool, calc: *const BiasWeightCalc(S, S1, S2, hasBias), in: *const [S1]f32, outputs: [S]*[S2]f32) void {
+        this.calculateFn = BiasWeightCalc(S, S1, S2, hasBias).calculateErased;
+        this.calculateData = calc;
+        this.calculateIn = in;
+        inline for (0..S) |s| {
+            this.calculateOut[s] = outputs[s];
+        }
+        const ct = this.currentTask + 1;
+        @atomicStore(usize, &this.currentTask, ct, .release);
+        calc.calculate(in, outputs, ThreadCount - 1);
+        w: while (true) {
+            std.atomic.spinLoopHint();
+            for (0..ThreadCount - 1) |i| {
+                if (@atomicLoad(usize, @as(*usize, @ptrCast(&this.finished[i])), .acquire) != ct) {
+                    continue :w;
+                }
+            }
+            return;
+        }
+    }
+
+    fn stop(this: *@This()) void {
+        this.stp = true;
+        @atomicStore(usize, &this.currentTask, this.currentTask + 1, .release);
+        for (this.threads) |t| {
+            t.?.join();
+        }
+    }
+};
+
 pub fn main(ini: std.process.Init) !void {
     var iter = ini.minimal.args.iterate();
     _ = iter.skip();
@@ -522,6 +654,9 @@ pub fn main(ini: std.process.Init) !void {
         };
     }
 
+    var threadSync = SyncThreads.init();
+    try threadSync.start();
+
     var pos: usize = 0;
     var vec: Vector = undefined;
     while (iter.next()) |a| {
@@ -536,8 +671,8 @@ pub fn main(ini: std.process.Init) !void {
 
         for (0..12) |layer| {
             var v: Vector = undefined;
-            layers[layer].attend(&vec, &v);
-            layers[layer].ffn(&v, &vec);
+            layers[layer].attend(&threadSync, &vec, &v);
+            layers[layer].ffn(&threadSync, &v, &vec);
         }
     }
     std.debug.print("\n", .{});
@@ -549,7 +684,7 @@ pub fn main(ini: std.process.Init) !void {
             var to: Vector = undefined;
             var logits: [50304]f32 = undefined;
             layerNorm(&vec, vv.outputNormBias, vv.outputNormWeight, &to);
-            const next = logitsF(&lg, &to, &logits, vv.tokens);
+            const next = logitsF(&lg, &threadSync, &to, &logits, vv.tokens);
             convBf16ToF32(&vv.tokenEmdebWeight[next], &vec);
             for (0..LayerSize) |u| {
                 vec[u] += vv.positionEmbedWeight[pos][u];
@@ -558,11 +693,12 @@ pub fn main(ini: std.process.Init) !void {
 
             for (0..12) |layer| {
                 var v: Vector = undefined;
-                layers[layer].attend(&vec, &v);
-                layers[layer].ffn(&v, &vec);
+                layers[layer].attend(&threadSync, &vec, &v);
+                layers[layer].ffn(&threadSync, &v, &vec);
             }
         }
     }
+    threadSync.stop();
 }
 
 fn gpt2CodepointToByte(cp: u21) ?u8 {
