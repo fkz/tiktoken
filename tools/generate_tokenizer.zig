@@ -44,10 +44,14 @@ fn findTokenId(strs: [Size][2][]const u8, str: []const u8, count: u16) ?u16 {
 }
 
 fn tokens(merges: []const u8) ?[Size]TokenValue {
+    var it = std.mem.splitScalar(u8, merges, '\n');
+    return tokensFromIterator(&it);
+}
+
+fn tokensFromIterator(it: anytype) ?[Size]TokenValue {
     var index: u16 = 256;
     var strs: [Size][2][]const u8 = undefined;
     var result: [Size]TokenValue = .{TokenValue{}} ** Size;
-    var it = std.mem.splitScalar(u8, merges, '\n');
     var progress: u16 = 0;
     while (it.next()) |line| {
         if (line.len == 0) continue;
@@ -248,15 +252,17 @@ fn linearlySpreadHashes(cache: *[CacheSize]u8) [4]u16 {
     return .{ max, count0, count1, 0 };
 }
 
-fn generateTokens(io: std.Io, allocator: std.mem.Allocator, input: []const u8, output: []const u8) !void {
+fn generateTokens(io: std.Io, input: []const u8, output: []const u8) !void {
     const file = try std.Io.Dir.cwd().openFile(io, input, .{});
     defer file.close(io);
-    var buffer: [4096]u8 = undefined;
-    var reader = file.reader(io, &buffer);
-    const merges = try reader.interface.allocRemaining(allocator, .unlimited);
-    defer allocator.free(merges);
-
-    const parsed = tokens(merges) orelse return error.InvalidMerges;
+    const stat = try file.stat(io);
+    if (stat.size == 0) return error.InvalidMerges;
+    const data = try std.posix.mmap(null, stat.size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
+    defer std.posix.munmap(data);
+    const parsed = if (std.mem.startsWith(u8, data, "GGUF")) blk: {
+        var it = try @import("gguf_merges.zig").Iterator.init(data);
+        break :blk tokensFromIterator(&it) orelse return error.InvalidMerges;
+    } else tokens(data) orelse return error.InvalidMerges;
     try std.Io.Dir.cwd().writeFile(io, .{
         .data = std.mem.asBytes(&parsed),
         .sub_path = output,
@@ -277,11 +283,18 @@ pub fn main(init: std.process.Init) !void {
     _ = it.skip();
     const command = it.next();
     if (command) |arg| {
+        if (std.mem.eql(u8, arg, "extract-merges")) {
+            const input = it.next() orelse return error.MissingGgufPath;
+            const output = it.next() orelse "merges.txt";
+            if (it.next() != null) return error.TooManyArguments;
+            try @import("gguf_merges.zig").extract(init.io, input, output);
+            return;
+        }
         if (std.mem.eql(u8, arg, "generate")) {
             const input = it.next() orelse "src/merges.txt";
             const output = it.next() orelse "tokens";
             if (it.next() != null) return error.TooManyArguments;
-            try generateTokens(init.io, init.arena.allocator(), input, output);
+            try generateTokens(init.io, input, output);
             return;
         }
     }
