@@ -1,0 +1,17 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer Input { uvec4 values[]; } src;
+layout(set = 0, binding = 1, std430) writeonly buffer Output { uvec4 values[]; } dst;
+// 65,536 invocations, each reading 1024 vectors: exactly 1 GiB per dispatch.
+// Adjacent lanes access adjacent vectors; each input contributes to a checksum.
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uvec4 a = uvec4(0), b = a, c = a, d = a;
+    for (uint i = 0; i < 1024; i += 4) {
+        a += src.values[id + (i + 0) * 65536];
+        b += src.values[id + (i + 1) * 65536];
+        c += src.values[id + (i + 2) * 65536];
+        d += src.values[id + (i + 3) * 65536];
+    }
+    dst.values[id] = a + b + c + d;
+}

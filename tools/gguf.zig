@@ -7,7 +7,8 @@ const Matrix = [LayerSize][LayerSize]u16;
 const TokenCount = 50257;
 const Heads = 12;
 
-const ThreadCount = 2;
+const ThreadCount = @import("build_options").thread_count;
+const Prefetch = @import("build_options").prefetch;
 
 const BlockData = struct {
     attnNormBias: *align(64) const Vector,
@@ -261,7 +262,7 @@ fn convBf16ToF32(from: *const [LayerSize]u16, to: *Vector) void {
     }
 }
 
-fn BiasWeightCalc(S: comptime_int, S1: comptime_int, S2: comptime_int, comptime hasBias: bool) type {
+fn BiasWeightCalc(S: comptime_int, S1: comptime_int, S2: comptime_int, comptime hasBias: bool, comptime hasGelu: bool) type {
     return struct {
         const P = 8;
         //const P = 1;
@@ -332,17 +333,25 @@ fn BiasWeightCalc(S: comptime_int, S1: comptime_int, S2: comptime_int, comptime 
                         }
 
                         const w1 = this.optimizedWeight[v][l][8 * m0 ..][0..8];
-                        //const w1prefetch = this.optimizedWeight[v][l][8 * (m0 + 1) ..][0..8];
+                        const w1p: ?*const [8][8]@Vector(32, u16) =
+                            if (8 * m0 + 8 * Prefetch < S1 / 2)
+                                this.optimizedWeight[v][l][8 * m0 + 8 * Prefetch ..][0..8]
+                            else if (l + 1 < end)
+                                this.optimizedWeight[v][l + 1][8 * m0 + 8 * Prefetch - S1 / 2 ..][0..8]
+                            else
+                                null;
                         for (0..8) |m| {
                             const in1 = ins[m];
                             const w2 = w1[m];
-                            //const w2prefetch = &w1[m + 12];
-                            //@prefetch(&w2prefetch[0], .{ .locality = 0 });
+                            if (comptime Prefetch > 0) {
+                                if (w1p) |w| {
+                                    inline for (0..P) |n| {
+                                        @prefetch(&w[m][n], .{ .locality = 0 });
+                                    }
+                                }
+                            }
                             inline for (0..P) |n| {
                                 const weights: @Vector(32, u16) = w2[n];
-                                //@prefetch(&w2prefetch[n], .{
-                                //    .locality = 0,
-                                //});
                                 accums[n] = asm ("vdpbf16ps %[in1], %[in2], %[acc]"
                                     : [acc] "=v" (-> @Vector(16, f32)),
                                     : [acc_in] "0" (accums[n]),
@@ -353,7 +362,8 @@ fn BiasWeightCalc(S: comptime_int, S1: comptime_int, S2: comptime_int, comptime 
                         }
                     }
                     for (0..P) |n| {
-                        o[16 * P * l + 16 * n ..][0..16].* = accums[n];
+                        const result: [16]f32 = if (hasGelu) @import("gelu.zig").gelu(accums[n]) else accums[n];
+                        o[16 * P * l + 16 * n ..][0..16].* = result;
                     }
                 }
             }
@@ -364,7 +374,7 @@ fn BiasWeightCalc(S: comptime_int, S1: comptime_int, S2: comptime_int, comptime 
 const KvCache = struct {
     const MaxLen = 1024;
 
-    weights: BiasWeightCalc(3, LayerSize, LayerSize, true),
+    weights: BiasWeightCalc(3, LayerSize, LayerSize, true, false),
 
     ks: *[MaxLen / 16][LayerSize][16]f32,
     vs: *[MaxLen]Vector,
@@ -387,7 +397,7 @@ const KvCache = struct {
         }
 
         return .{
-            .weights = try BiasWeightCalc(3, LayerSize, LayerSize, true).init(alloc, attnQkvBias, attnQkvWeight),
+            .weights = try BiasWeightCalc(3, LayerSize, LayerSize, true, false).init(alloc, attnQkvBias, attnQkvWeight),
             .ks = ks,
             .vs = vs,
             .length = 0,
@@ -397,7 +407,7 @@ const KvCache = struct {
     fn next(this: *@This(), syncThreads: *SyncThreads, in: *const Vector, q: *Vector) void {
         var k: Vector = undefined;
         const outputs: [3]*Vector = .{ q, &k, &this.vs[this.length] };
-        syncThreads.calculate(3, LayerSize, LayerSize, true, &this.weights, in, outputs);
+        syncThreads.calculate(3, LayerSize, LayerSize, true, false, &this.weights, in, outputs);
         for (0..LayerSize) |i| {
             this.ks[this.length / 16][i][this.length % 16] = k[i];
         }
@@ -455,10 +465,10 @@ const LayerCalculation = struct {
 
     kvCache: KvCache,
 
-    output: BiasWeightCalc(1, LayerSize, LayerSize, true),
+    output: BiasWeightCalc(1, LayerSize, LayerSize, true, false),
 
-    ffnUp: BiasWeightCalc(1, LayerSize, Hidden, true),
-    ffnDown: BiasWeightCalc(1, Hidden, LayerSize, true),
+    ffnUp: BiasWeightCalc(1, LayerSize, Hidden, true, true),
+    ffnDown: BiasWeightCalc(1, Hidden, LayerSize, true, false),
 
     fn attend(this: *@This(), syncThreads: *SyncThreads, in: *const Vector, out: *Vector) void {
         var v: Vector = undefined;
@@ -470,20 +480,10 @@ const LayerCalculation = struct {
         this.kvCache.next(syncThreads, &v, &q);
         this.kvCache.attend(&q, &a);
 
-        syncThreads.calculate(1, LayerSize, LayerSize, true, &this.output, &a, .{out});
+        syncThreads.calculate(1, LayerSize, LayerSize, true, false, &this.output, &a, .{out});
 
         for (0..LayerSize) |i| {
             out[i] += in[i];
-        }
-    }
-
-    const u = @sqrt(2.0 / std.math.pi);
-
-    fn gelu(v: *[Hidden]f32) void {
-        for (0..Hidden) |i| {
-            const c = v[i];
-            const r = c / 2.0 * (1.0 + std.math.tanh(u * (c + 0.044715 * c * c * c)));
-            v[i] = r;
         }
     }
 
@@ -491,9 +491,8 @@ const LayerCalculation = struct {
         var v: Vector = undefined;
         var hidden: [Hidden]f32 = undefined;
         layerNorm(in, this.ffnBias, this.ffnWeight, &v);
-        syncThreads.calculate(1, LayerSize, Hidden, true, &this.ffnUp, &v, .{&hidden});
-        gelu(&hidden);
-        syncThreads.calculate(1, Hidden, LayerSize, true, &this.ffnDown, &hidden, .{out});
+        syncThreads.calculate(1, LayerSize, Hidden, true, true, &this.ffnUp, &v, .{&hidden});
+        syncThreads.calculate(1, Hidden, LayerSize, true, false, &this.ffnDown, &hidden, .{out});
         for (0..LayerSize) |i| {
             out[i] += in[i];
         }
@@ -501,7 +500,7 @@ const LayerCalculation = struct {
 };
 
 const LogitsF = struct {
-    calc: BiasWeightCalc(1, LayerSize, 50304, false),
+    calc: BiasWeightCalc(1, LayerSize, 50304, false, false),
 
     fn init(alloc: std.mem.Allocator, tokenWeights: *const [TokenCount][LayerSize]u16) !LogitsF {
         const tmp = try alloc.create([50304][LayerSize]u16);
@@ -511,11 +510,11 @@ const LogitsF = struct {
                 tmp[i][j] = 0.0;
             }
         }
-        return .{ .calc = try BiasWeightCalc(1, LayerSize, 50304, false).init(alloc, {}, tmp) };
+        return .{ .calc = try BiasWeightCalc(1, LayerSize, 50304, false, false).init(alloc, {}, tmp) };
     }
 
     fn logits(this: *const @This(), syncThreads: *SyncThreads, v: *const Vector, l: *[50304]f32) void {
-        syncThreads.calculate(1, LayerSize, 50304, false, &this.calc, v, .{l});
+        syncThreads.calculate(1, LayerSize, 50304, false, false, &this.calc, v, .{l});
     }
 };
 
@@ -604,8 +603,8 @@ const SyncThreads = struct {
         }
     }
 
-    fn calculate(this: *@This(), S: comptime_int, S1: comptime_int, S2: comptime_int, comptime hasBias: bool, calc: *const BiasWeightCalc(S, S1, S2, hasBias), in: *const [S1]f32, outputs: [S]*[S2]f32) void {
-        this.calculateFn = BiasWeightCalc(S, S1, S2, hasBias).calculateErased;
+    fn calculate(this: *@This(), S: comptime_int, S1: comptime_int, S2: comptime_int, comptime hasBias: bool, comptime hasGelu: bool, calc: *const BiasWeightCalc(S, S1, S2, hasBias, hasGelu), in: *const [S1]f32, outputs: [S]*[S2]f32) void {
+        this.calculateFn = BiasWeightCalc(S, S1, S2, hasBias, hasGelu).calculateErased;
         this.calculateData = calc;
         this.calculateIn = in;
         inline for (0..S) |s| {
@@ -615,9 +614,9 @@ const SyncThreads = struct {
         @atomicStore(usize, &this.currentTask, ct, .release);
         calc.calculate(in, outputs, ThreadCount - 1);
         w: while (true) {
-            std.atomic.spinLoopHint();
             for (0..ThreadCount - 1) |i| {
                 if (@atomicLoad(usize, @as(*usize, @ptrCast(&this.finished[i])), .acquire) != ct) {
+                    std.atomic.spinLoopHint();
                     continue :w;
                 }
             }
@@ -678,9 +677,9 @@ fn generate(ini: std.process.Init, vv: *const @This(), ids: []const u16, text_ou
             .ffnBias = vv.blocks[i].ffnNormBias,
             .ffnWeight = vv.blocks[i].ffnNormWeight,
             .kvCache = try KvCache.init(ini.arena.allocator(), vv.blocks[i].attnQkvBias, vv.blocks[i].attnQkvWeight),
-            .output = try BiasWeightCalc(1, LayerSize, LayerSize, true).init(ini.arena.allocator(), vv.blocks[i].attnOutputBias, vv.blocks[i].attnOutputWeight),
-            .ffnUp = try BiasWeightCalc(1, LayerSize, Hidden, true).init(ini.arena.allocator(), vv.blocks[i].ffnUpBias, vv.blocks[i].ffnUpWeight),
-            .ffnDown = try BiasWeightCalc(1, Hidden, LayerSize, true).init(ini.arena.allocator(), vv.blocks[i].ffnDownBias, vv.blocks[i].ffnDownWeight),
+            .output = try BiasWeightCalc(1, LayerSize, LayerSize, true, false).init(ini.arena.allocator(), vv.blocks[i].attnOutputBias, vv.blocks[i].attnOutputWeight),
+            .ffnUp = try BiasWeightCalc(1, LayerSize, Hidden, true, true).init(ini.arena.allocator(), vv.blocks[i].ffnUpBias, vv.blocks[i].ffnUpWeight),
+            .ffnDown = try BiasWeightCalc(1, Hidden, LayerSize, true, false).init(ini.arena.allocator(), vv.blocks[i].ffnDownBias, vv.blocks[i].ffnDownWeight),
         };
     }
 
@@ -776,6 +775,10 @@ const DecodedToken = struct {
         }
     }
 };
+
+test {
+    _ = @import("gelu.zig");
+}
 
 test "order in simd" {
     const a: [16]u16 = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };

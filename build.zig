@@ -3,6 +3,12 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const thread_count = b.option(usize, "thread-count", "Total GGUF compute threads, including the calling thread (default: 1)") orelse 1;
+    if (thread_count == 0) @panic("-Dthread-count must be at least 1");
+    const prefetch = b.option(usize, "prefetch", "GGUF weight prefetch distance in 4 KiB blocks (0 disables, default: 0)") orelse 0;
+    const gguf_options = b.addOptions();
+    gguf_options.addOption(usize, "thread_count", thread_count);
+    gguf_options.addOption(usize, "prefetch", prefetch);
     const tokenizer = b.createModule(.{
         .root_source_file = b.path("tools/generate_tokenizer.zig"),
         .target = target,
@@ -13,6 +19,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    gguf.addOptions("build_options", gguf_options);
     const exe = b.addExecutable(.{
         .name = "tiktoken",
         // The GGUF kernels use vector inline assembly unsupported by the native backend.
