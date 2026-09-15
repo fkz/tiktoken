@@ -46,7 +46,7 @@ fn findTokenId(strs: [Size][2][]const u8, str: []const u8, count: u16) ?u16 {
 fn tokens(merges: []const u8) ?[Size]TokenValue {
     var index: u16 = 256;
     var strs: [Size][2][]const u8 = undefined;
-    var result: [Size]TokenValue = undefined;
+    var result: [Size]TokenValue = .{TokenValue{}} ** Size;
     var it = std.mem.splitScalar(u8, merges, '\n');
     var progress: u16 = 0;
     while (it.next()) |line| {
@@ -57,8 +57,9 @@ fn tokens(merges: []const u8) ?[Size]TokenValue {
             std.debug.print("Progress: {}%\n", .{progress});
         }
         var l = std.mem.splitScalar(u8, line, ' ');
-        const t1 = l.next().?;
-        const t2 = l.next().?;
+        const t1 = l.next() orelse return null;
+        const t2 = l.next() orelse return null;
+        if (t1.len == 0 or t2.len == 0 or l.next() != null) return null;
         const t1tok = findTokenId(strs, t1, index) orelse return null;
         const t2tok = findTokenId(strs, t2, index) orelse return null;
         strs[index - 256] = .{ t1, t2 };
@@ -72,14 +73,6 @@ fn tokens(merges: []const u8) ?[Size]TokenValue {
             std.debug.print("Warning: Size reached, not all token grammar", .{});
             break;
         }
-    }
-    while (index < Size) {
-        result[index] = .{
-            .token1 = 0,
-            .token2 = 0,
-            .resultToken = 0,
-        };
-        index += 1;
     }
     return result;
 }
@@ -255,32 +248,43 @@ fn linearlySpreadHashes(cache: *[CacheSize]u8) [4]u16 {
     return .{ max, count0, count1, 0 };
 }
 
-test "parsing" {
-    const file = try std.Io.Dir.cwd().openFile(std.testing.io, "/home/fabian/zig/tiktoken/src/merges.txt", .{});
-    defer file.close(std.testing.io);
+fn generateTokens(io: std.Io, allocator: std.mem.Allocator, input: []const u8, output: []const u8) !void {
+    const file = try std.Io.Dir.cwd().openFile(io, input, .{});
+    defer file.close(io);
+    var buffer: [4096]u8 = undefined;
+    var reader = file.reader(io, &buffer);
+    const merges = try reader.interface.allocRemaining(allocator, .unlimited);
+    defer allocator.free(merges);
 
-    const stat = try file.stat(std.testing.io);
-
-    const mapped = try std.posix.mmap(
-        null,
-        stat.size,
-        .{ .READ = true },
-        .{ .TYPE = .PRIVATE },
-        file.handle,
-        0,
-    );
-
-    const u = tokens(mapped);
-    const j: []const u8 = @ptrCast(&u.?);
-    std.debug.print("size {}", .{j.len});
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
-        .data = @ptrCast(&u.?),
-        .sub_path = "tokens",
+    const parsed = tokens(merges) orelse return error.InvalidMerges;
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .data = std.mem.asBytes(&parsed),
+        .sub_path = output,
     });
-    try std.testing.expect(u.?[0].resultToken == 256);
+}
+
+test "parsing" {
+    const parsed = tokens("Ġ t\nĠ a\nĠt a\n").?;
+    try std.testing.expectEqual(TokenValue{ .token1 = ' ', .token2 = 't', .resultToken = 256 }, parsed[0]);
+    try std.testing.expectEqual(TokenValue{ .token1 = 256, .token2 = 'a', .resultToken = 258 }, parsed[2]);
+    for (parsed[3..]) |token| try std.testing.expectEqual(TokenValue{}, token);
+    try std.testing.expect(tokens("missing\n") == null);
+    try std.testing.expect(tokens("unknown t\n") == null);
 }
 
 pub fn main(init: std.process.Init) !void {
+    var it = init.minimal.args.iterate();
+    _ = it.skip();
+    const command = it.next();
+    if (command) |arg| {
+        if (std.mem.eql(u8, arg, "generate")) {
+            const input = it.next() orelse "src/merges.txt";
+            const output = it.next() orelse "tokens";
+            if (it.next() != null) return error.TooManyArguments;
+            try generateTokens(init.io, init.arena.allocator(), input, output);
+            return;
+        }
+    }
     const file = try std.Io.Dir.cwd().openFile(init.io, "tokens", .{});
     const mapped = try std.posix.mmap(
         null,
@@ -292,10 +296,8 @@ pub fn main(init: std.process.Init) !void {
     );
     const t: *[Size]TokenValue = @ptrCast(mapped);
     var count: usize = 10_000;
-    var it = init.minimal.args.iterate();
-    _ = it.skip();
     const breakCond: u8 = 10;
-    if (it.next()) |arg| {
+    if (command) |arg| {
         if (std.mem.eql(u8, arg, "tokenize")) {
             // parse stdin
             var buf: [4096]u8 = undefined;
