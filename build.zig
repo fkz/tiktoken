@@ -6,9 +6,14 @@ pub fn build(b: *std.Build) void {
     const thread_count = b.option(usize, "thread-count", "Total GGUF compute threads, including the calling thread (default: 1)") orelse 1;
     if (thread_count == 0) @panic("-Dthread-count must be at least 1");
     const prefetch = b.option(usize, "prefetch", "GGUF weight prefetch distance in 4 KiB blocks (0 disables, default: 0)") orelse 0;
+    const prefetch_type = b.option(usize, "prefetch-type", "Prefetch type") orelse 0;
     const gguf_options = b.addOptions();
+    const huge_pages = b.option(bool, "huge-pages", "Request Linux transparent huge pages for reordered GGUF weights (default: false)") orelse false;
+    if (huge_pages and target.result.os.tag != .linux) @panic("-Dhuge-pages requires Linux");
+    gguf_options.addOption(bool, "huge_pages", huge_pages);
     gguf_options.addOption(usize, "thread_count", thread_count);
     gguf_options.addOption(usize, "prefetch", prefetch);
+    gguf_options.addOption(usize, "prefetch_type", prefetch_type);
     const tokenizer = b.createModule(.{
         .root_source_file = b.path("tools/generate_tokenizer.zig"),
         .target = target,

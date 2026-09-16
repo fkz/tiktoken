@@ -9,6 +9,38 @@ const Heads = 12;
 
 const ThreadCount = @import("build_options").thread_count;
 const Prefetch = @import("build_options").prefetch;
+const HugePages = @import("build_options").huge_pages;
+
+// Keep both benchmark modes' allocation layouts identical. Whole, aligned
+// 2 MiB regions allow even the smaller matrices to use Linux x86 THP and
+// keep madvise away from allocator metadata and neighboring allocations.
+// The caller's arena owns the backing allocation, including its padding.
+fn createOptimizedWeight(comptime T: type, alloc: std.mem.Allocator) !*T {
+    if (@import("builtin").os.tag != .linux or !HugePages) return alloc.create(T);
+    const huge_page_size = 2 * 1024 * 1024;
+    const size = std.mem.alignForward(usize, @sizeOf(T), huge_page_size);
+    const bytes = try alloc.alignedAlloc(u8, .fromByteUnits(huge_page_size), size);
+    errdefer alloc.free(bytes);
+    try std.posix.madvise(bytes.ptr, bytes.len, std.posix.MADV.HUGEPAGE);
+    // Fault the padding in too, so the entire final huge page is backed.
+    @memset(bytes, 0);
+    return @ptrCast(bytes.ptr);
+}
+
+test "optimized weight allocation spans huge page boundaries" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const T = [2 * 1024 * 1024 + 64]u8;
+    const weight = try createOptimizedWeight(T, arena.allocator());
+    if (@import("builtin").os.tag == .linux) {
+        try std.testing.expectEqual(@as(usize, 0), @intFromPtr(weight) % (2 * 1024 * 1024));
+        try std.testing.expectEqual(@as(u8, 0), weight[weight.len - 1]);
+    }
+    weight[0] = 17;
+    weight[weight.len - 1] = 29;
+    try std.testing.expectEqual(@as(u8, 17), weight[0]);
+    try std.testing.expectEqual(@as(u8, 29), weight[weight.len - 1]);
+}
 
 const BlockData = struct {
     attnNormBias: *align(64) const Vector,
@@ -272,7 +304,7 @@ fn BiasWeightCalc(S: comptime_int, S1: comptime_int, S2: comptime_int, comptime 
         optimizedWeight: *const [S][S2 / 16 / P][S1 / 2][P]@Vector(32, u16),
 
         fn init(alloc: std.mem.Allocator, bias: if (hasBias) *const [S][S2]f32 else void, weight: *const [S][S2][S1]u16) !@This() {
-            const optimizedWeight = try alloc.create(@typeInfo(@FieldType(@This(), "optimizedWeight")).pointer.child);
+            const optimizedWeight = try createOptimizedWeight(@typeInfo(@FieldType(@This(), "optimizedWeight")).pointer.child, alloc);
             for (0..S) |v| {
                 for (0..S2 / 16 / P) |l| {
                     for (0..S1 / 2) |m| {
@@ -518,42 +550,44 @@ const LogitsF = struct {
     }
 };
 
-fn logitsF(logF: *const LogitsF, syncThreads: *SyncThreads, v: *const Vector, logits: *[50304]f32, tokens: *const [TokenCount][]const u8) u16 {
-    logF.logits(syncThreads, v, logits);
-
-    var maxim: [8]f32 = .{-std.math.inf(f32)} ** 8;
-    var maximIndex: [8]u16 = .{0} ** 8;
-
-    for (0..TokenCount) |i| {
-        if (logits[i] >= maxim[7]) {
-            maxim[7] = logits[i];
-            maximIndex[7] = @intCast(i);
-            for (1..8) |m| {
-                if (maxim[7 - m] < logits[i]) {
-                    maxim[8 - m] = maxim[7 - m];
-                    maxim[7 - m] = logits[i];
-                    maximIndex[8 - m] = maximIndex[7 - m];
-                    maximIndex[7 - m] = @intCast(i);
-                } else {
-                    break;
-                }
-            }
+// Keep the four most likely tokens and renormalize their softmax probabilities.
+// draw is uniform in [0, 1); accepting it explicitly makes sampling testable.
+fn sampleTopFour(logits: []const f32, draw: f64) u16 {
+    std.debug.assert(logits.len >= 4);
+    std.debug.assert(draw >= 0.0 and draw < 1.0);
+    var top: [4]f32 = .{-std.math.inf(f32)} ** 4;
+    var indices: [4]u16 = .{0} ** 4;
+    for (logits, 0..) |logit, i| {
+        if (logit <= top[3]) continue;
+        var slot: usize = 3;
+        while (slot > 0 and logit > top[slot - 1]) : (slot -= 1) {
+            top[slot] = top[slot - 1];
+            indices[slot] = indices[slot - 1];
         }
+        top[slot] = logit;
+        indices[slot] = @intCast(i);
     }
 
-    var sum: f32 = 0.0;
-    const max = maxim[0];
-    for (0..TokenCount) |i| {
-        logits[i] = @exp(logits[i] - max);
-        sum += logits[i];
+    var weights: [4]f64 = undefined;
+    var total: f64 = 0.0;
+    for (top, &weights) |logit, *weight| {
+        weight.* = @exp(@as(f64, logit) - @as(f64, top[0]));
+        total += weight.*;
     }
+    const threshold = draw * total;
+    var cumulative: f64 = 0.0;
+    for (weights, indices) |weight, index| {
+        cumulative += weight;
+        if (threshold < cumulative) return index;
+    }
+    return indices[3]; // Guard against rounding at the upper boundary.
+}
 
-    //for (0..8) |i| {
-    //std.debug.print("token {} '{s}' prob {d:.1}%\n", .{ maximIndex[i], tokens[maximIndex[i]], logits[maximIndex[i]] / sum * 100.0 });
-    //}
-
-    std.debug.print("{f}", .{DecodedToken{ .token = tokens[maximIndex[0]] }});
-    return maximIndex[0];
+fn logitsF(logF: *const LogitsF, syncThreads: *SyncThreads, v: *const Vector, logits: *[50304]f32, tokens: *const [TokenCount][]const u8, random: std.Random) u16 {
+    logF.logits(syncThreads, v, logits);
+    const next = sampleTopFour(logits[0..TokenCount], random.float(f64));
+    std.debug.print("{f}", .{DecodedToken{ .token = tokens[next] }});
+    return next;
 }
 
 const SyncThreads = struct {
@@ -687,6 +721,10 @@ fn generate(ini: std.process.Init, vv: *const @This(), ids: []const u16, text_ou
     try threadSync.start();
     defer threadSync.stop();
 
+    var seed: u64 = undefined;
+    std.Io.random(ini.io, std.mem.asBytes(&seed));
+    var prng = std.Random.DefaultPrng.init(seed);
+
     var pos: usize = 0;
     var vec: Vector = undefined;
     for (ids) |j| {
@@ -718,7 +756,7 @@ fn generate(ini: std.process.Init, vv: *const @This(), ids: []const u16, text_ou
             var to: Vector = undefined;
             var logits: [50304]f32 = undefined;
             layerNorm(&vec, vv.outputNormBias, vv.outputNormWeight, &to);
-            const next = logitsF(&lg, &threadSync, &to, &logits, vv.tokens);
+            const next = logitsF(&lg, &threadSync, &to, &logits, vv.tokens, prng.random());
             convBf16ToF32(&vv.tokenEmdebWeight[next], &vec);
             for (0..LayerSize) |u| {
                 vec[u] += vv.positionEmbedWeight[pos][u];
@@ -786,4 +824,25 @@ test "order in simd" {
     inline for (0..16) |i| {
         try std.testing.expectEqual(a[i], b[i]);
     }
+}
+
+test "top four sampling preserves relative probabilities and excludes other tokens" {
+    // Unsorted weights 1, 4, 2, 3, plus a fifth candidate that must be excluded.
+    const logits = [_]f32{ 0.0, @log(@as(f32, 4.0)), @log(@as(f32, 2.0)), @log(@as(f32, 3.0)), -0.1 };
+    var counts: [5]usize = .{0} ** 5;
+    for (0..10000) |i| {
+        const draw = (@as(f64, @floatFromInt(i)) + 0.5) / 10000.0;
+        counts[sampleTopFour(&logits, draw)] += 1;
+    }
+    try std.testing.expectEqualSlices(usize, &.{ 1000, 4000, 2000, 3000, 0 }, &counts);
+}
+
+test "top four sampling handles ties and extreme logit gaps" {
+    const tied = [_]f32{ 5.0, 5.0, 5.0, 5.0, 5.0 };
+    for (0..4) |i| {
+        try std.testing.expectEqual(@as(u16, @intCast(i)), sampleTopFour(&tied, @as(f64, @floatFromInt(i)) / 4.0));
+    }
+    const extreme = [_]f32{ -10000.0, 10000.0, -20000.0, 0.0, -30000.0 };
+    try std.testing.expectEqual(@as(u16, 1), sampleTopFour(&extreme, 0.0));
+    try std.testing.expectEqual(@as(u16, 1), sampleTopFour(&extreme, 0.9999999999999999));
 }

@@ -1,5 +1,28 @@
 # Profiling `continue "Hello"`
 
+To compare transparent huge pages for reordered matrix weights on Linux:
+
+```bash
+zig build -Doptimize=ReleaseFast -Dhuge-pages=false
+tools/perf/cpu.sh /path/to/gpt2-bf16.gguf Hello
+zig build -Doptimize=ReleaseFast -Dhuge-pages=true
+tools/perf/cpu.sh /path/to/gpt2-bf16.gguf Hello
+```
+
+`-Dhuge-pages` defaults to `false`. On Linux, both modes allocate reordered
+weights in 2 MiB-aligned, 2 MiB-rounded buffers and initialize the padding;
+`false` applies `MADV_NOHUGEPAGE`, while `true` applies `MADV_HUGEPAGE` before
+initialization. This includes attention, feed-forward, and output/logits weights.
+The original model mapping and KV caches are unaffected. Padding increases
+memory use in both modes. The caller's arena releases these buffers on teardown.
+
+Huge pages are a kernel request, not a guarantee: THP must be enabled (`madvise`
+or `always`), and physical memory availability can affect backing. Check
+`AnonHugePages` in `/proc/PID/smaps_rollup` during generation to verify use.
+The alignment targets 2 MiB THP on x86 Linux. Enabling this option on non-Linux
+targets is rejected. Keep thread count and prefetch options identical, warm up
+each build, and repeat measurements; these scripts include startup/reordering.
+
 Build once; compilation is excluded from all measurements:
 
 ```bash
@@ -373,3 +396,78 @@ The GPU achieves about 88% of the memory bus's 89.6 GB/s theoretical peak.
 Adding CPU readers does not improve aggregate throughput in this test: they
 compete for the same RAM bandwidth. The GPU can use bandwidth beyond what the
 CPU-only test reaches, but this does not by itself establish an inference speedup.
+
+## Live 100 ms counter timeline
+
+```bash
+zig build -Doptimize=ReleaseFast
+tools/perf/track.sh /path/to/gpt2-bf16.gguf Hello
+# Optional comparison after a change and rebuild:
+tools/perf/track.sh /path/to/gpt2-bf16.gguf Hello --label after \
+  --baseline perf-results/track-XXXXXXXX
+```
+
+`track.sh` records **instructions, cycles**, and these four memory counters:
+
+- `ls_any_fills_from_sys.dram_io_near`
+- `ls_dmnd_fills_from_sys.dram_io_near`
+- `ls_hw_pf_dc_fills.dram_io_near`
+- `ls_sw_pf_dc_fills.dram_io_near` (software-prefetch fills)
+
+The main output is a **live table**, with one row per window (approximately
+0–100 ms, 100–200 ms, etc.), printed as perf supplies each interval. CPU columns
+show instructions, cycles, and interval IPC. Memory columns show Any, Demand,
+HW PF, and SW PF fills converted to **GB in that window / GB/s**, using
+64 bytes per fill and decimal GB (10^9 bytes). The tool verifies 64-byte L1 data
+cache lines on all allowed CPUs. These are fill byte-equivalents, not total
+memory-controller traffic. CPU cells retain millions of events / millions per
+second. For example, 70 million fills in 100 ms become 4.48 GB / 44.8 GB/s. This lets you compare early initialization
+activity with later execution; windows are relative to process start, not exact
+application phase markers. A window may straddle a phase boundary.
+
+It performs one unmeasured warm-up and one measured repeat by default. The
+warm-up warms caches; initialization still executes in each measured process.
+`--repeats 5` changes the repeat count; `--interval-ms 200` changes the default
+100 ms sampling interval. Each repeat uses two sequential passes: instructions/cycles together, then the
+four memory counters together. This avoids exhausting hardware counter slots.
+Timelines from the two passes are **not simultaneous**. Both groups follow the
+application and its threads in user space. Unsupported events, unschedulable
+groups, missing counts, and coverage below 99% fail explicitly. Use `--cpu-only`
+on machines without these AMD events, to record just CPU counters.
+Python 3.11+ and perf are required; `PYTHON`, `PERF`, and `BINARY` override paths.
+Build separately; the tool measures the existing binary.
+
+Each unique `perf-results/track-*/` directory preserves:
+
+- `timeline.txt`: the readable interval tables shown live in the terminal.
+- `timeline.csv`: run number, pass scope, elapsed timestamp, actual interval duration, event,
+  interval count, count/second, and counter scheduling coverage. The final partial
+  interval uses its actual duration. Counts are interval deltas, not cumulative.
+  Memory rows also include `GB` and `GB_per_second`; CPU rows leave those blank.
+- `summary.json`: every run's totals and IPC, medians/min/max, label, timestamp,
+  commit and working-tree status, binary/model hashes, CPU, affinity, and command.
+- `report.md`: readable summary, with percentage changes when `--baseline` names
+  an earlier results directory (or its `summary.json`). A zero baseline displays
+  `n/a`; percentage changes are descriptive, not statistical significance tests.
+- Raw perf CSV, event definitions, and stdout/stderr for each run and the warm-up.
+
+Saved directories provide history across builds; compare against any earlier
+baseline. Baseline comparisons require matching model content, prompt, events,
+interval, CPU model, and affinity. Binary hashes may differ intentionally. Keep
+thread counts, build settings, power state, and background load comparable;
+the tool cannot guarantee those conditions. Hashing the model and the warm-up
+warm filesystem caches. No cache clearing or CPU pinning is performed.
+
+`elapsed_s` is the CPU pass duration; `memory_elapsed_s` is the separate memory
+pass duration. Each uses the final perf interval timestamp; totals sum the intervals and
+IPC is total instructions / total cycles for each run. Measurements include model
+loading, reordering, prompt processing, generation, and teardown. Interval
+collection itself has overhead, especially at short sampling intervals.
+
+The [Linux Zen 5 event definitions](https://github.com/torvalds/linux/blob/master/tools/perf/pmu-events/arch/x86/amdzen5/load-store.json)
+describe these as L1 data-cache fills supplied by same-NUMA-node DRAM/MMIO.
+**Any fills overlap the demand/HW/SW categories**; do not add all four. Software
+prefetch counts completed fills, not executed prefetch instructions. L1 hits,
+far-node fills, and prefetches that only fill L2 are outside this view. These
+numbers do not measure total DRAM bandwidth or prefetch accuracy. Use the existing
+`bandwidth.sh` / `prefetch.sh --l2` for the complementary L2 view.
